@@ -1,0 +1,8 @@
+click
+h5py
+numpy
+pandas
+scipy
+tables
+torch
+pytest
