@@ -515,7 +515,39 @@ def global_recenter(
     type=float,
     default=(-0.25, 0.25),
     show_default=True,
-    help="Uniform random label shift range in seconds.",
+    help="Uniform random label shift range in seconds, used by --shift-model uniform.",
+)
+@click.option(
+    "--shift-model",
+    type=click.Choice(["prompt-delay", "uniform"]),
+    default="prompt-delay",
+    show_default=True,
+    help=(
+        "How to synthesize prompt times. prompt-delay makes prompt_time earlier "
+        "than ground-truth event_time by a positive reaction delay."
+    ),
+)
+@click.option(
+    "--delay-mean",
+    type=float,
+    default=0.25,
+    show_default=True,
+    help="Mean reaction delay in seconds for --shift-model prompt-delay.",
+)
+@click.option(
+    "--delay-std",
+    type=float,
+    default=0.07,
+    show_default=True,
+    help="Reaction-delay standard deviation for --shift-model prompt-delay.",
+)
+@click.option(
+    "--delay-range",
+    nargs=2,
+    type=float,
+    default=(0.05, 0.55),
+    show_default=True,
+    help="Min/max positive reaction delay for --shift-model prompt-delay.",
 )
 @click.option("--seed", type=int, default=0, show_default=True)
 @click.option("--pre", type=float, default=0.3, show_default=True)
@@ -574,6 +606,10 @@ def simulate_shift_eval(
     prompt_start: int,
     num_prompts: int,
     shift_range: tuple[float, float],
+    shift_model: str,
+    delay_mean: float,
+    delay_std: float,
+    delay_range: tuple[float, float],
     seed: int,
     pre: float,
     post: float,
@@ -608,11 +644,20 @@ def simulate_shift_eval(
         raise click.BadParameter("num-prompts must be positive")
     if shift_range[0] > shift_range[1]:
         raise click.BadParameter("shift-range must be ordered as low high")
-    if uncertainty[0] > min(shift_range[0], 0.0) or uncertainty[1] < max(
-        shift_range[1], 0.0
+    if delay_range[0] < 0 or delay_range[0] > delay_range[1]:
+        raise click.BadParameter("delay-range must be ordered positive min max")
+    if delay_std < 0:
+        raise click.BadParameter("delay-std must be non-negative")
+    if shift_model == "prompt-delay":
+        effective_shift_range = (-delay_range[1], -delay_range[0])
+    else:
+        effective_shift_range = shift_range
+    if uncertainty[0] > min(effective_shift_range[0], 0.0) or uncertainty[1] < max(
+        effective_shift_range[1], 0.0
     ):
         click.echo(
-            "Warning: uncertainty window does not fully cover shift-range and zero; "
+            "Warning: uncertainty window does not fully cover synthetic shift range "
+            "and zero; "
             "some ground-truth times may be unreachable.",
             err=True,
         )
@@ -631,18 +676,38 @@ def simulate_shift_eval(
     )
 
     rng = np.random.default_rng(seed)
-    shifts = rng.uniform(shift_range[0], shift_range[1], size=len(selected))
+    if shift_model == "prompt-delay":
+        if delay_std == 0:
+            delays = np.full(len(selected), delay_mean, dtype=float)
+        else:
+            delays = rng.normal(delay_mean, delay_std, size=len(selected))
+        delays = np.clip(delays, delay_range[0], delay_range[1])
+        shifts = -delays
+    else:
+        delays = np.full(len(selected), np.nan, dtype=float)
+        shifts = rng.uniform(shift_range[0], shift_range[1], size=len(selected))
     shifted_prompts = selected.copy()
     shifted_prompts["ground_truth_time"] = selected["time"].to_numpy(dtype=float)
     shifted_prompts["random_shift_seconds"] = shifts
+    shifted_prompts["simulated_reaction_delay_seconds"] = delays
+    shifted_prompts["shift_model"] = shift_model
     shifted_prompts["time"] = shifted_prompts["ground_truth_time"] + shifts
     shifted_prompts["original_prompt_index"] = selected.index.to_numpy(dtype=int)
-    click.echo(
-        "Created simulated shifted labels: "
-        f"range=({shifts.min():+.3f}, {shifts.max():+.3f})s, "
-        f"mean={shifts.mean():+.3f}s",
-        err=True,
-    )
+    if shift_model == "prompt-delay":
+        click.echo(
+            "Created simulated prompt-time labels: "
+            f"delay range=({delays.min():.3f}, {delays.max():.3f})s, "
+            f"delay mean={delays.mean():.3f}s; "
+            "synthetic prompt time is earlier than ground truth.",
+            err=True,
+        )
+    else:
+        click.echo(
+            "Created simulated shifted labels: "
+            f"range=({shifts.min():+.3f}, {shifts.max():+.3f})s, "
+            f"mean={shifts.mean():+.3f}s",
+            err=True,
+        )
 
     times = timeseries["time"]
     sample_rate = infer_sample_rate(times)
@@ -708,6 +773,10 @@ def simulate_shift_eval(
     aligned["random_shift_seconds"] = shifted_by_index[
         "random_shift_seconds"
     ].to_numpy(dtype=float)
+    aligned["simulated_reaction_delay_seconds"] = shifted_by_index[
+        "simulated_reaction_delay_seconds"
+    ].to_numpy(dtype=float)
+    aligned["shift_model"] = shifted_by_index["shift_model"].to_numpy()
     aligned["original_prompt_index"] = shifted_by_index[
         "original_prompt_index"
     ].to_numpy(dtype=int)
@@ -1067,6 +1136,264 @@ def _write_alignment_svg(
 
     lines.append("</svg>")
     output_svg.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _compute_features_for_session(
+    timeseries,
+    feature: str,
+    smoothing_ms: float,
+    mpf_window_length: int,
+    mpf_stride: int,
+    mpf_n_fft: int,
+    mpf_fft_stride: int,
+    mpf_chunk_output_frames: int,
+):
+    """Compute alignment features (mpf or envelope) and their timestamps once."""
+
+    times = timeseries["time"]
+    sample_rate = infer_sample_rate(times)
+    if feature == "mpf":
+        features, feature_times = multivariate_power_frequency_features(
+            timeseries["emg"],
+            times,
+            window_length=mpf_window_length,
+            stride=mpf_stride,
+            n_fft=mpf_n_fft,
+            fft_stride=mpf_fft_stride,
+            fs=sample_rate,
+            chunk_output_frames=mpf_chunk_output_frames,
+            progress=True,
+        )
+    else:
+        features = emg_envelope_features(
+            timeseries["emg"], sample_rate=sample_rate, smoothing_ms=smoothing_ms
+        )
+        feature_times = times
+    return features, feature_times
+
+
+@main.command("multi-session-recenter-eval")
+@click.argument("hdf5_paths", nargs=-1, type=click.Path(exists=True, path_type=Path))
+@click.option("--output-dir", required=True, type=click.Path(path_type=Path))
+@click.option(
+    "--offsets",
+    type=str,
+    default=None,
+    help=(
+        "Comma-separated per-session systematic offsets in seconds, one per HDF5 "
+        "file (e.g. '-0.25,-0.10,-0.40'). If omitted, offsets are spread evenly "
+        "across [-0.40, -0.10]."
+    ),
+)
+@click.option(
+    "--jitter",
+    type=float,
+    default=0.05,
+    show_default=True,
+    help="Uniform +/- per-event jitter added on top of each session offset.",
+)
+@click.option("--num-prompts", type=int, default=100000, show_default=True)
+@click.option("--pre", type=float, default=0.3, show_default=True)
+@click.option("--post", type=float, default=0.9, show_default=True)
+@click.option(
+    "--uncertainty",
+    nargs=2,
+    type=float,
+    default=(-0.15, 0.55),
+    show_default=True,
+    help="Search window; must cover the full injected shift range and zero.",
+)
+@click.option("--iterations", type=int, default=5, show_default=True)
+@click.option("--beam-width", type=int, default=30, show_default=True)
+@click.option("--candidate-step", type=float, default=0.02, show_default=True)
+@click.option("--min-event-separation", type=float, default=0.02, show_default=True)
+@click.option(
+    "--template-estimator",
+    type=click.Choice(["rerp", "average"]),
+    default="rerp",
+    show_default=True,
+)
+@click.option("--template-ridge", type=float, default=1e-3, show_default=True)
+@click.option(
+    "--max-shift",
+    type=float,
+    default=0.5,
+    show_default=True,
+    help="Max template shift allowed when matching to the global reference.",
+)
+@click.option("--seed", type=int, default=0, show_default=True)
+@click.option("--smoothing-ms", type=float, default=50.0, show_default=True)
+@click.option(
+    "--feature",
+    type=click.Choice(["mpf", "envelope"]),
+    default="mpf",
+    show_default=True,
+)
+@click.option("--mpf-window-length", type=int, default=200, show_default=True)
+@click.option("--mpf-stride", type=int, default=40, show_default=True)
+@click.option("--mpf-n-fft", type=int, default=64, show_default=True)
+@click.option("--mpf-fft-stride", type=int, default=10, show_default=True)
+@click.option("--mpf-chunk-output-frames", type=int, default=4096, show_default=True)
+def multi_session_recenter_eval(
+    hdf5_paths: tuple[Path, ...],
+    output_dir: Path,
+    offsets: str | None,
+    jitter: float,
+    num_prompts: int,
+    pre: float,
+    post: float,
+    uncertainty: tuple[float, float],
+    iterations: int,
+    beam_width: int,
+    candidate_step: float,
+    min_event_separation: float,
+    template_estimator: str,
+    template_ridge: float,
+    max_shift: float,
+    seed: int,
+    smoothing_ms: float,
+    feature: str,
+    mpf_window_length: int,
+    mpf_stride: int,
+    mpf_n_fft: int,
+    mpf_fft_stride: int,
+    mpf_chunk_output_frames: int,
+) -> None:
+    """Validate the full pipeline: inject DIFFERENT systematic offsets per session,
+    align each with EM, then run global recentering and check whether the
+    between-session offset differences collapse.
+
+    Single-session EM cannot recover a systematic (constant) offset, so each
+    session's EM error stays near its injected offset. Global recentering anchors
+    all sessions to a shared grand-average template, which should remove the
+    BETWEEN-session offset differences (the absolute common offset stays
+    unidentifiable, by design).
+    """
+
+    if len(hdf5_paths) < 2:
+        raise click.BadParameter("Provide at least two HDF5 files for a multi-session test")
+
+    if offsets is None:
+        n = len(hdf5_paths)
+        offset_values = list(np.linspace(-0.40, -0.10, n))
+    else:
+        offset_values = [float(x) for x in offsets.split(",")]
+        if len(offset_values) != len(hdf5_paths):
+            raise click.BadParameter(
+                f"--offsets has {len(offset_values)} values but {len(hdf5_paths)} files given"
+            )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(seed)
+
+    aligned_tables: dict[str, pd.DataFrame] = {}
+    template_banks = {}
+    per_event_rows = []
+
+    for path, offset in zip(hdf5_paths, offset_values):
+        session_id = path.stem
+        click.echo(f"\n=== Session {session_id}: injected offset {offset:+.3f}s ===", err=True)
+        timeseries, prompts = load_discrete_gesture_hdf5(path)
+        prompts = prompts.sort_values("time").reset_index(drop=True)
+        selected = prompts.iloc[:num_prompts].copy()
+
+        gt = selected["time"].to_numpy(dtype=float)
+        shift = offset + rng.uniform(-jitter, jitter, size=len(selected))
+        shifted = selected.copy()
+        shifted["ground_truth_time"] = gt
+        shifted["time"] = gt + shift
+        shifted["original_prompt_index"] = selected.index.to_numpy(dtype=int)
+
+        features, feature_times = _compute_features_for_session(
+            timeseries, feature, smoothing_ms,
+            mpf_window_length, mpf_stride, mpf_n_fft, mpf_fft_stride,
+            mpf_chunk_output_frames,
+        )
+
+        aligned, templates = align_prompt_times(
+            features=features,
+            times=feature_times,
+            prompts=shifted[["name", "time", "ground_truth_time", "original_prompt_index"]],
+            pre_s=pre,
+            post_s=post,
+            uncertainty_window=uncertainty,
+            max_iterations=iterations,
+            beam_width=beam_width,
+            candidate_step_s=candidate_step,
+            recenter_templates=False,
+            template_estimator=template_estimator,
+            template_ridge=template_ridge,
+            enforce_monotonic=True,
+            min_event_separation_s=min_event_separation,
+            progress=True,
+        )
+        aligned_tables[session_id] = aligned
+        template_banks[session_id] = templates
+
+    click.echo("\n=== Running global recentering across sessions ===", err=True)
+    _, recentered_tables, shift_summary = global_recenter_aligned_prompts(
+        aligned_tables, template_banks, max_shift_s=max_shift,
+    )
+
+    # Evaluate each stage against ground truth.
+    summary_rows = []
+    for session_id, offset in zip([p.stem for p in hdf5_paths], offset_values):
+        em = aligned_tables[session_id].sort_index()
+        rc = recentered_tables[session_id].sort_index()
+        gt = em["ground_truth_time"].to_numpy(dtype=float)
+        err_raw = em["prompt_time"].to_numpy(dtype=float) - gt
+        err_em = em["aligned_time"].to_numpy(dtype=float) - gt
+        err_rc = rc["aligned_time"].to_numpy(dtype=float) - gt
+
+        def demean_std(e):
+            return float(np.std(e - np.median(e)))
+
+        summary_rows.append(
+            {
+                "session": session_id,
+                "injected_offset": offset,
+                "n": len(gt),
+                "mean_err_raw": float(np.mean(err_raw)),
+                "mean_err_em": float(np.mean(err_em)),
+                "mean_err_recenter": float(np.mean(err_rc)),
+                "demeaned_std_raw": demean_std(err_raw),
+                "demeaned_std_em": demean_std(err_em),
+                "demeaned_std_recenter": demean_std(err_rc),
+            }
+        )
+
+    summary = pd.DataFrame(summary_rows)
+    summary_csv = output_dir / "multi_session_recenter_summary.csv"
+    summary.to_csv(summary_csv, index=False)
+    shift_summary.to_csv(output_dir / "multi_session_recenter_shifts.csv", index=False)
+    for session_id, rc in recentered_tables.items():
+        rc.to_csv(output_dir / f"{session_id}_recentered_eval.csv", index=False)
+
+    between_em = float(np.std(summary["mean_err_em"]))
+    between_rc = float(np.std(summary["mean_err_recenter"]))
+
+    click.echo("\n================ RESULT ================")
+    click.echo(summary.to_string(index=False))
+    click.echo(
+        "\nBetween-session spread of mean error (the thing global recenter should fix):"
+    )
+    click.echo(f"  after EM only       : std = {between_em:.4f}s")
+    click.echo(f"  after global recenter: std = {between_rc:.4f}s")
+    if between_rc < between_em:
+        click.echo(
+            f"  -> recenter REDUCED between-session spread "
+            f"({between_em:.4f} -> {between_rc:.4f}). Global recenter is working."
+        )
+    else:
+        click.echo(
+            "  -> recenter did NOT reduce between-session spread; "
+            "check templates/feature/num-prompts."
+        )
+    click.echo(
+        "\nNote: the absolute common offset is unidentifiable by design; judge "
+        "EM by demeaned_std (relative timing) and recenter by between-session spread."
+    )
+    click.echo(f"\nSaved summary to {summary_csv}")
 
 
 if __name__ == "__main__":

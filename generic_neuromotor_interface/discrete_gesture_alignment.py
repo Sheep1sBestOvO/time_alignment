@@ -972,35 +972,44 @@ def _align_sequence(
         (float(np.sum(observed**2)), observed.copy(), [], 0.0)
     ]
     for event_pos, candidates in enumerate(candidate_indices):
-        next_beams = []
-        for _, residual, chosen, prior_cost in beams:
-            for candidate in candidates:
-                candidate = int(candidate)
-                if enforce_monotonic and chosen:
-                    min_allowed = chosen[-1] + min_event_separation_samples
-                    if candidate < min_allowed:
-                        continue
-                candidate_times = chosen + [int(candidate)]
-                next_residual = residual.copy()
-                name = str(sequence.iloc[event_pos]["name"])
-                _subtract_template(
-                    next_residual,
-                    start_idx,
-                    candidate,
-                    templates.templates[name],
-                    templates,
-                )
-                offset = float(times[candidate] - prompt_times[event_pos])
-                next_prior_cost = prior_cost + prompt_prior_weight * offset**2
-                cost = float(np.sum(next_residual**2)) + next_prior_cost
-                next_beams.append(
-                    (cost, next_residual, candidate_times, next_prior_cost)
-                )
+        name = str(sequence.iloc[event_pos]["name"])
+
+        def expand(apply_monotonic: bool):
+            produced = []
+            for _, residual, chosen, prior_cost in beams:
+                for candidate in candidates:
+                    candidate = int(candidate)
+                    if apply_monotonic and chosen:
+                        min_allowed = chosen[-1] + min_event_separation_samples
+                        if candidate < min_allowed:
+                            continue
+                    candidate_times = chosen + [int(candidate)]
+                    next_residual = residual.copy()
+                    _subtract_template(
+                        next_residual,
+                        start_idx,
+                        candidate,
+                        templates.templates[name],
+                        templates,
+                    )
+                    offset = float(times[candidate] - prompt_times[event_pos])
+                    next_prior_cost = prior_cost + prompt_prior_weight * offset**2
+                    cost = float(np.sum(next_residual**2)) + next_prior_cost
+                    produced.append(
+                        (cost, next_residual, candidate_times, next_prior_cost)
+                    )
+            return produced
+
+        next_beams = expand(enforce_monotonic)
+        if not next_beams and enforce_monotonic:
+            # No ordering-consistent placement exists for this event (can happen
+            # with wide windows / coarse steps). Degrade gracefully for this
+            # event rather than aborting the whole sequence.
+            next_beams = expand(False)
         if not next_beams:
             raise ValueError(
-                "Beam search found no valid monotonic candidates. Try reducing "
-                "min_event_separation_s, increasing the uncertainty window, or "
-                "setting enforce_monotonic=False."
+                "Beam search produced no candidates. Try increasing the "
+                "uncertainty window or candidate density."
             )
         next_beams.sort(key=lambda item: item[0])
         beams = next_beams[:beam_width]
