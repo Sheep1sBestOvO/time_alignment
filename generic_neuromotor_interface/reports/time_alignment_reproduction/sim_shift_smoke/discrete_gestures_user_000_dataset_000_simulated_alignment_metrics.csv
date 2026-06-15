@@ -1,0 +1,8 @@
+metric,value
+count,24.0
+mae_before,0.12833942969640097
+mae_after,0.21882248918215433
+median_abs_error_before,0.13761961460113525
+median_abs_error_after,0.2037792205810547
+mean_improvement,-0.09048305948575337
+fraction_improved,0.2916666666666667

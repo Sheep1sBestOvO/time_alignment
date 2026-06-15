@@ -1,0 +1,550 @@
+Discrete Gesture Time Alignment 复现报告
+====================================
+
+1. 当前目标
+-------
+
+这份报告总结我目前对论文中 discrete gesture 数据预处理，尤其是 time alignment 方法的理解，以及当前代码复现进度。
+
+目前我的重点不是完整复现 decoder 训练流程，而是复现论文中把粗略 prompt timestamp 校正为更准确 gesture event timestamp 的预处理步骤。
+
+核心问题是：
+
+公开数据中的 discrete gesture 是连续 sEMG 记录，并且只有 prompt timestamp。prompt time 只是系统提示参与者做某个手势的时间，不一定等于真实手势执行时间，也不一定等于 EMG 激活的时间。
+
+因此，预处理的目标是：从连续 sEMG 信号和粗略 prompt time 中，推断更准确的 gesture event time。
+
+2. 对论文方法的理解
+-----------
+
+论文把 discrete gesture time alignment 描述成 forced alignment 问题。实验采集时，系统会 prompt 参与者做某个手势，因此作者知道每个手势的大致时间。但是由于人的反应时间不同，prompt time 不够精确。如果直接用 prompt time 作为训练标签，会影响模型检测手势的 timing 和 latency。
+
+论文中的生成模型可以写成：
+
+    x(t) = sum_k phi_k(t - t_k) + n(t)
+
+其中：
+
+  - x(t) 是观测到的连续 sEMG feature。
+  - phi_k 是某类 gesture 的时空模板。
+  - t_k 是第 k 个 gesture 的真实事件时间。
+  - n(t) 是噪声项。
+
+alignment 的目标是找到一组 gesture event time t_k，使得这些 gesture template 平移并叠加后，能够最好地解释观测到的连续 sEMG feature。
+
+我目前理解中最重要的区分是：
+
+  - uncertainty range：真实 event time 可以在 prompt time 周围搜索的范围。例如 prompt_time - 0.3s 到 prompt_time + 0.8s。
+  - template window：围绕某个候选 event time 截取多长的信号来表示 gesture waveform。例如 event_time - 0.3s 到 event_time + 0.9s。
+
+这两个窗口不是同一个东西。uncertainty range 决定 event time 可以移动到哪里；template window 决定在某个 event time 周围看多长的 EMG 波形来估计或匹配 template。
+
+3. 公开数据中实际包含什么
+--------------
+
+我下载了 discrete gesture 的 small subset。每个 HDF5 文件中主要包含：
+
+    data:
+      emg   连续 sEMG 数组，形状大致是 (T, 16)
+      time  每个采样点对应的时间戳，形状是 (T,)
+
+    prompts:
+      name  gesture 名称
+      time  prompt 时间戳
+
+    stages:
+      任务阶段或 block 的 metadata
+
+公开数据提供的是连续 sEMG 信号，而不是已经切好的 isolated gesture trials。它也没有提供更底层的硬件 raw ADC stream 或滤波前原始设备数据。因此，在目前公开数据条件下，data/emg 就是我们能使用的最低层级信号。
+
+数据的相邻 sample 时间差约为：
+
+    0.0005 s
+
+对应采样率：
+
+    2000 Hz
+
+这和项目中的常量 EMG_SAMPLE_RATE = 2000 一致。
+
+4. 从公开数据中观察到的 prompt pattern
+----------------------------
+
+我通过 HDF5 中的 prompts 表检查采集 pattern：
+
+    prompts = pd.read_hdf(hdf5_path, "prompts").sort_values("time")
+    intervals = prompts["time"].diff().dropna()
+
+small subset 中观察到：
+
+    user_000:
+      prompts = 1900
+      相邻 prompt interval 的 median ~= 0.755 s
+      min interval ~= 0.020 s
+      max interval ~= 233 s
+
+    user_001:
+      prompts = 1181
+      相邻 prompt interval 的 median ~= 0.780 s
+      min interval ~= 0.020 s
+      max interval ~= 91.9 s
+
+    user_002:
+      prompts = 1900
+      相邻 prompt interval 的 median ~= 0.745 s
+      min interval ~= 0.020 s
+      max interval ~= 407.8 s
+
+因此，典型相邻 prompt 间隔大约在 0.75-0.78 s。这里使用 median 而不是 mean，因为 mean 会被不同 stage 或 partition 之间的大间隔拉大。
+
+很短的 0.02 s 间隔主要来自 press/release 成对事件，例如：
+
+    index_press -> index_release
+    middle_press -> middle_release
+
+所以采集 pattern 不能只用一个平均间隔描述，应该分开考虑：
+
+  - 普通相邻 prompt 的间隔；
+  - press/release 成对事件的很短间隔；
+  - stage 或 recording partition 之间的大间隔；
+  - 常见 gesture transition。
+
+当我使用 uncertainty_window = [-0.3, 0.8] 时，很多 prompt 的 uncertainty interval 会发生重叠，因为这个范围总长度是 1.1 s，大于典型 prompt 间隔 0.75 s 左右。因此会形成很多 multi-gesture sequence，这和论文中需要对 sequence 做联合 alignment 的动机一致。
+
+5. 当前代码复现情况
+-----------
+
+我新增的核心实现文件是：
+
+    generic_neuromotor_interface/discrete_gesture_alignment.py
+
+命令行工具是：
+
+    generic_neuromotor_interface/scripts/discrete_gesture_alignment.py
+
+当前实现支持：
+
+  - 读取 discrete gesture HDF5 数据；
+  - 提取一个简单的 rectified-smoothed EMG envelope feature；
+  - 统计 prompt interval；
+  - 根据 uncertainty window 把 prompts 分成 overlapping sequences；
+  - 用当前 event time 估计 gesture-specific templates；
+  - 迭代校正 prompt time；
+  - 对单个 event 做 template matching；
+  - 对多个 event 的 sequence 用 beam search 做联合 alignment；
+  - 保存 aligned prompts 到 CSV。
+
+查看 prompt pattern 的命令：
+
+    python3 -m generic_neuromotor_interface.scripts.discrete_gesture_alignment inspect \
+      /Users/yoooung/Desktop/generic-neuromotor-interface/data \
+      --uncertainty -0.3 0.8
+
+运行 time alignment 的命令示例：
+
+    python3 -m generic_neuromotor_interface.scripts.discrete_gesture_alignment align \
+      /Users/yoooung/Desktop/generic-neuromotor-interface/data/discrete_gestures_user_000_dataset_000.hdf5 \
+      /Users/yoooung/Desktop/generic-neuromotor-interface/data/user_000_aligned_prompts.csv \
+      --pre 0.3 \
+      --post 0.9 \
+      --uncertainty -0.3 0.8 \
+      --candidate-step 0.02 \
+      --beam-width 30
+
+6. 当前实现和原论文的主要差距
+----------------
+
+目前实现是对论文 forced-alignment 思想的概念复现，还不是完全一致的严格复现。
+
+主要差距如下。
+
+6.1 Feature 不一致
+---------------
+
+论文中使用的是 MPF features。当前代码中使用的是一个简化版 feature：
+
+    abs(EMG) -> moving average smoothing -> optional z-score
+
+这个 feature 可以用来测试 alignment 框架是否工作，但并不等价于论文中的 MPF feature。
+
+6.2 Template estimation 仍是近似复现
+------------------------------
+
+论文提到 template 是用 EMG analogue of regression-based estimator of event-related potential 来估计的，目的是从快速连续手势中 disentangle overlapping contributions。
+
+当前代码已经加入了 rERP 风格的 template estimator：把连续 feature 写成由所有 gesture lag regressors 组成的线性模型，然后用 ridge least squares 联合估计所有 gesture templates。原来的“围绕 event time 截窗口后对同类 gesture 求平均”仍保留为 average baseline，方便对照。
+
+不过，这仍然是论文方法的近似复现。论文没有在公开代码中给出完整 estimator 细节，因此当前实现还需要通过 synthetic data、residual、template sharpness 和下游 decoder 表现来验证。
+
+6.3 Re-centering 简化
+-------------------
+
+论文中提到最后做了 global recentering：通过 session template 和 global template 的 maximal correlation 来标准化不同个体的 template 对齐。
+
+当前实现中使用的是更简单的 energy-peak recentering：找到每个 template 能量最大的时间点，然后把 peak 移到 event time zero 附近。这可以缓解 prompt-initialized template 把反应延迟吸收进 template 的问题，但不是论文中的精确方法。
+
+6.4 Beam search 约束不完整
+---------------------
+
+论文提到 beam search 使用了一些来自 data-collection protocol 的 ad hoc constraints，用来限制调整后的时间偏离 prompt time 的范围。
+
+当前实现只使用了：
+
+  - uncertainty range；
+  - candidate step；
+  - beam width。
+
+还没有加入更具体的协议约束，例如：
+
+  - press 必须先于 release；
+  - press/release 的 duration 范围；
+  - sequence 内 event time 单调递增；
+  - 某些 stage 特定的 timing prior。
+
+6.5 缺少真实 timestamp ground truth
+-------------------------------
+
+公开数据没有提供真实 gesture onset timestamp。因此无法直接计算 time alignment 的 timestamp error。
+
+目前只能用间接方式判断 alignment 是否合理，例如：
+
+  - alignment offset 分布；
+  - template 是否变 sharp；
+  - reconstruction residual 是否下降；
+  - sequence 可视化；
+  - synthetic data；
+  - downstream decoder performance。
+
+6.6 尚未接入训练 pipeline
+-------------------
+
+项目原本的 DiscreteGesturesTransform 仍然直接用 prompt time 生成训练 target pulse。当前 alignment 结果是单独保存为 CSV，还没有进一步改造训练 transform 让模型使用 aligned timestamps。
+
+7. 如何判断当前 time alignment 是否做得对
+------------------------------
+
+因为没有真实 event time ground truth，需要从多个角度交叉验证。
+
+7.1 Alignment offset 分布
+-----------------------
+
+查看：
+
+    alignment_offset = aligned_time - prompt_time
+
+合理结果应该满足：
+
+  - 大多数 offset 在 uncertainty range 内；
+  - 不应该大量贴在搜索边界，例如全部集中在 -0.3 或 0.8；
+  - 同一 participant 的 offset 应该有相对稳定的中心；
+  - press/release 这类事件要额外检查是否符合协议逻辑。
+
+7.2 Template sharpness
+----------------------
+
+比较 prompt-time template 和 aligned-time template。
+
+如果 alignment 合理，aligned 后的 template 通常应该：
+
+  - peak 更集中；
+  - 上升沿更清楚；
+  - trial 间 variance 更小；
+  - 不同 gesture 的 template 更可区分。
+
+7.3 Reconstruction residual
+---------------------------
+
+根据生成模型：
+
+    observed ~= sum shifted templates
+
+可以比较 alignment 前后：
+
+    residual = observed - sum shifted templates
+
+如果 alignment 更合理，residual 的平方和通常应该下降。
+
+7.4 Sequence 可视化
+----------------
+
+随机选择若干 sequence，画出：
+
+  - EMG feature envelope；
+  - prompt time；
+  - aligned time；
+  - gesture label。
+
+人工观察 aligned time 是否比 prompt time 更贴近 EMG activation。
+
+7.5 Synthetic data
+------------------
+
+自己构造带 ground truth 的模拟数据：
+
+    x(t) = template_A(t - true_t_A) + template_B(t - true_t_B) + noise
+
+然后只给算法粗略 prompt time，检查它能否恢复 true_t_A 和 true_t_B。
+
+7.6 下游 decoder 对比
+-----------------
+
+用两套 label 训练同一个 decoder：
+
+  - 原始 prompt-time labels；
+  - aligned-time labels。
+
+比较：
+
+  - validation loss；
+  - CLER；
+  - detection latency；
+  - false positive；
+  - qualitative event detection timing。
+
+8. 需要明确的关键参数
+------------
+
+8.1 Uncertainty range
+---------------------
+
+示例：
+
+    uncertainty_window = (-0.3, 0.8)
+
+含义：
+
+    真实 event time 可以从 prompt_time - 0.3s
+    移动到 prompt_time + 0.8s
+
+这个参数控制 event time 的搜索范围。
+
+从 open data 是否能推理出来：
+
+  - open data 只有 prompt time，没有真实 onset time；
+  - 因此无法直接从 open data 精确估计 uncertainty range；
+  - 但可以从 prompt interval 判断某个 uncertainty range 会不会导致大量 sequence overlap；
+  - 也可以通过 offset histogram、template sharpness、residual、下游性能来间接评估。
+
+建议方式：
+
+  - 先使用较保守的范围，例如 [-0.3, 0.8]；
+  - 如果大量 aligned time 卡在边界，说明范围可能不合适；
+  - 如果范围太宽导致 alignment 不稳定，需要缩小范围或加入 protocol constraints；
+  - 如果自己采集数据，应该通过 pilot/calibration 估计参与者反应时间分布，再设定 uncertainty bounds。
+
+8.2 Template window: `pre_s` 和 `post_s`
+---------------------------------------
+
+示例：
+
+    pre_s = 0.3
+    post_s = 0.9
+
+含义：
+
+    每个候选 event time 用 event 前 0.3s 到 event 后 0.9s 的信号表示
+
+这个参数定义 template 的时间长度。
+
+从 open data 是否能推理出来：
+
+  - open data 没有真实 gesture onset/offset；
+  - 因此不能直接推理出最优 pre_s/post_s；
+  - 可以通过可视化 prompt 附近或 aligned 附近的 EMG envelope，估计 gesture response 持续多久；
+  - 也可以比较不同窗口下 template sharpness、residual 和下游模型表现。
+
+建议尝试：
+
+    pre/post = 0.2/0.6
+    pre/post = 0.3/0.9
+    pre/post = 0.5/1.0
+
+原则是：窗口要足够包含 baseline、activation rise、peak 和 decay，但不要长到经常包含无关的相邻 gesture。
+
+如果自己采集数据，建议加入 well-isolated calibration block，用孤立手势估计 EMG response duration，再确定 pre_s/post_s。
+
+8.3 Candidate step
+------------------
+
+示例：
+
+    candidate_step_s = 0.02
+
+含义：
+
+    每隔 20 ms 尝试一个候选 event time
+
+较小的 candidate step 时间精度更高，但计算更慢。
+
+建议：
+
+  - debug 时可以用 0.04 s；
+  - baseline 可以用 0.02 s；
+  - final experiment 可以尝试 0.01 s。
+
+8.4 Beam width
+--------------
+
+示例：
+
+    beam_width = 30
+
+含义：
+
+在多 gesture sequence 的 beam search 中，每一步保留 cost 最小的前 30 个候选组合。
+
+建议：
+
+  - debug 时用 10；
+  - baseline 用 30；
+  - 如果 sequence 很长或者结果不稳定，可以增大。
+
+8.5 Feature smoothing
+---------------------
+
+示例：
+
+    smoothing_ms = 50
+
+当前 envelope feature 会对 rectified EMG 做 50 ms moving average。
+
+这个参数影响时间分辨率：
+
+  - smoothing 太小：feature 噪声大；
+  - smoothing 太大：timing 被抹宽。
+
+建议尝试：
+
+    25 ms
+    50 ms
+    100 ms
+
+并根据 template sharpness、residual 和下游 decoder 表现选择。
+
+9. 如果我们自己采集数据，需要弄清楚什么
+---------------------
+
+如果后续自己采集数据，为了复现或改进 alignment，需要记录足够完整的信号和 protocol metadata。
+
+9.1 必须采集的信号信息
+-------------
+
+建议记录：
+
+  - 连续多通道 sEMG；
+  - 每个 sample 的时间戳或稳定采样时钟；
+  - 采样率；
+  - 通道数；
+  - electrode/band placement；
+  - 硬件滤波、增益、参考方式；
+  - raw 或 minimally processed EMG；
+  - 和 prompt 系统同步的 event markers。
+
+最好同时保存：
+
+  - 尽可能 raw 的硬件信号；
+  - 实际用于模型的 processed signal。
+
+这样后续才能复现 preprocessing。
+
+9.2 必须采集的 prompt metadata
+-------------------------
+
+每个 prompt 至少应记录：
+
+  - gesture name；
+  - prompt onset time；
+  - prompt offset time，如果有；
+  - stage/block/session id；
+  - trial index；
+  - 原始计划中的 gesture sequence；
+  - gesture 类型，例如 press、release、hold、click、directional；
+  - 如果是 press/release，记录预期 press duration 或 release cue。
+
+9.3 需要定义清楚的采集 pattern
+---------------------
+
+需要提前明确：
+
+  - gesture vocabulary；
+  - sequence order；
+  - randomization rule；
+  - prompt interval distribution；
+  - 是否采集 isolated gestures；
+  - 是否采集 fast continuous gestures；
+  - press/release 是否作为两个 label；
+  - press 和 release 的目标间隔；
+  - 每个 block 的 rest interval；
+  - stage/block 边界；
+  - 每类 gesture 的重复次数；
+  - 是否要求参与者每次回到 rest posture；
+  - 是否故意让相邻 gesture 快速连续，以产生 overlap。
+
+9.4 建议增加 calibration block
+--------------------------
+
+建议自采数据至少包含两类 block。
+
+第一类是 well-isolated calibration block：
+
+  - 手势之间有较长 rest；
+  - 用来估计 clean template；
+  - 用来估计反应时间分布；
+  - 用来估计 EMG response duration；
+  - 用来选择 pre_s/post_s 和 uncertainty bounds。
+
+第二类是 fast continuous sequence block：
+
+  - 手势快速连续出现；
+  - 更接近真实控制场景；
+  - 用来测试 forced alignment 是否能处理 overlap。
+
+9.5 如果可能，加入辅助 ground truth
+--------------------------
+
+公开数据最大的问题是没有真实 gesture onset ground truth。自采时可以考虑增加：
+
+  - high-speed video；
+  - motion capture；
+  - finger force sensor；
+  - keyboard/mouse/button log；
+  - IMU；
+  - 对一小部分数据做人工标注。
+
+哪怕只对一小部分数据有 ground truth，也可以更定量地评估 alignment error。
+
+10. 建议的下一步
+----------
+
+1. 先在一个 HDF5 文件上跑 alignment，保存 aligned prompts。
+
+2. 增加可视化工具：
+
+   - alignment offset histogram；
+   - before/after template plot；
+   - random sequence plot，画 prompt time 和 aligned time。
+
+3. 增加 residual comparison：
+
+   - prompt-time reconstruction residual；
+   - aligned-time reconstruction residual。
+
+4. 继续验证当前 MPF feature 和 rERP template estimator 是否能改善 alignment。
+
+5. 加入 protocol-aware constraints：
+
+   - press 必须先于 release；
+   - press/release duration bounds；
+   - event time 在 sequence 内保持单调；
+   - 不同 stage 使用不同 timing prior。
+
+6. 把 aligned timestamps 接入训练 transform。
+
+7. 比较 prompt labels 和 aligned labels 训练出的 decoder 表现。
+
+11. 给导师的简短总结
+------------
+
+当前代码已经复现了论文 time alignment 的核心思想：从 prompt time 初始化 gesture time，估计 gesture-specific template，把 uncertainty interval 重叠的 prompts 组成 sequence，并用 template matching / beam search 推断更合理的 event time。
+
+但这还不是完全严格的论文复现。当前已经加入 MPF feature 和 rERP 风格的 template estimator，但仍然缺少论文中 estimator 的全部实现细节、global correlation-based recentering、以及基于采集协议的 beam-search constraints。公开数据可以用来分析 prompt timing pattern，但不能直接给出真实 gesture onset。因此参数选择和 alignment 质量评估需要结合可视化、residual、synthetic data、downstream decoder，以及如果可能的话自采 calibration/ground-truth 数据。
