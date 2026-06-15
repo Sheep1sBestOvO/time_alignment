@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 
 from generic_neuromotor_interface.discrete_gesture_alignment import (
+    _candidate_indices,
     align_prompt_times,
     emg_envelope_features,
     estimate_templates,
@@ -600,6 +601,13 @@ def global_recenter(
     show_default=True,
     help="Optional per-iteration energy-peak recentering. Keep off for paper-style EM.",
 )
+@click.option(
+    "--with-oracle/--no-oracle",
+    default=False,
+    show_default=True,
+    help="Also compute an oracle upper bound (templates built from ground-truth "
+    "times) to separate the search core from template-estimation quality.",
+)
 def simulate_shift_eval(
     hdf5_path: Path,
     output_dir: Path,
@@ -632,6 +640,7 @@ def simulate_shift_eval(
     plot_left: float,
     plot_right: float,
     recenter: bool,
+    with_oracle: bool,
 ) -> None:
     """Randomly perturb event labels, align them, and evaluate against original labels.
 
@@ -788,6 +797,18 @@ def simulate_shift_eval(
         aligned["abs_error_before"] - aligned["abs_error_after"]
     )
 
+    if with_oracle:
+        click.echo(
+            "Computing oracle upper bound (templates from ground-truth times).",
+            err=True,
+        )
+        oracle_times = _oracle_align_times(
+            features, feature_times, aligned, pre, post, uncertainty, candidate_step
+        )
+        aligned["oracle_time"] = oracle_times
+        aligned["error_oracle"] = aligned["oracle_time"] - aligned["ground_truth_time"]
+        aligned["abs_error_oracle"] = np.abs(aligned["error_oracle"])
+
     stem = hdf5_path.stem
     shifted_csv = output_dir / f"{stem}_simulated_shifted_prompts.csv"
     aligned_csv = output_dir / f"{stem}_simulated_aligned_prompts.csv"
@@ -811,11 +832,72 @@ def simulate_shift_eval(
     click.echo(f"Saved aligned prompts to {aligned_csv}")
     click.echo(f"Saved metrics to {metrics_csv}")
     click.echo(f"Saved multichannel plot to {plot_svg}")
+    summary_cols = ["abs_error_before", "abs_error_after", "error_improvement"]
+    if with_oracle:
+        summary_cols.insert(2, "abs_error_oracle")
     click.echo(
-        aligned[["abs_error_before", "abs_error_after", "error_improvement"]]
-        .describe(percentiles=[0.05, 0.5, 0.95])
-        .to_string()
+        aligned[summary_cols].describe(percentiles=[0.05, 0.5, 0.95]).to_string()
     )
+    if with_oracle:
+        click.echo(
+            "\nOracle = upper bound with ground-truth templates. If abs_error_after "
+            "is far above abs_error_oracle, the gap is template-estimation/EM "
+            "convergence, not the search core or task difficulty."
+        )
+
+
+def _oracle_align_times(
+    features: np.ndarray,
+    feature_times: np.ndarray,
+    aligned: pd.DataFrame,
+    pre: float,
+    post: float,
+    uncertainty: tuple[float, float],
+    candidate_step: float,
+) -> np.ndarray:
+    """Upper-bound control: build templates from the TRUE (ground_truth) times,
+    then do a single matched-filter search around each shifted prompt time.
+
+    This 'cheats' by using ground truth to estimate sharp, correctly-centered
+    templates, isolating the search core from the (failing) self-bootstrapped
+    template estimation. Returns the oracle-aligned time for each row of
+    ``aligned`` (index-aligned).
+    """
+
+    truth = aligned.copy()
+    truth["time"] = truth["ground_truth_time"].to_numpy(dtype=float)
+    bank = estimate_templates(
+        features, feature_times, truth, pre, post,
+        aligned_time_col="time", method="average",
+    )
+    pre_n, post_n, length = bank.pre_samples, bank.post_samples, bank.length
+
+    out = np.full(len(aligned), np.nan)
+    prompt_times = aligned["prompt_time"].to_numpy(dtype=float)
+    names = aligned["name"].astype(str).to_numpy()
+    for i in range(len(aligned)):
+        template = bank.templates.get(names[i])
+        if template is None:
+            out[i] = prompt_times[i]
+            continue
+        cands = _candidate_indices(
+            feature_times, prompt_times[i],
+            uncertainty[0], uncertainty[1], candidate_step, bank.sample_rate,
+        )
+        best_cost, best_idx = np.inf, int(
+            np.searchsorted(feature_times, prompt_times[i])
+        )
+        for c in cands:
+            c = int(c)
+            start = c - pre_n
+            stop = start + length
+            if start < 0 or stop > len(features):
+                continue
+            cost = float(np.sum((features[start:stop] - template) ** 2))
+            if cost < best_cost:
+                best_cost, best_idx = cost, c
+        out[i] = float(feature_times[best_idx])
+    return out
 
 
 def _write_simulation_metrics(aligned: pd.DataFrame, output_csv: Path) -> None:
@@ -849,6 +931,19 @@ def _write_simulation_metrics(aligned: pd.DataFrame, output_csv: Path) -> None:
             "value": float((aligned["error_improvement"] > 0).mean()),
         },
     ]
+    if "abs_error_oracle" in aligned.columns:
+        rows.extend(
+            [
+                {
+                    "metric": "mae_oracle",
+                    "value": float(aligned["abs_error_oracle"].mean()),
+                },
+                {
+                    "metric": "median_abs_error_oracle",
+                    "value": float(aligned["abs_error_oracle"].median()),
+                },
+            ]
+        )
     pd.DataFrame(rows).to_csv(output_csv, index=False)
 
 
