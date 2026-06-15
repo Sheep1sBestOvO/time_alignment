@@ -130,6 +130,7 @@ def multivariate_power_frequency_features(
     frequency_bins: Sequence[tuple[float, float]] | None = DEFAULT_MPF_FREQUENCY_BINS,
     chunk_output_frames: int = 4096,
     zscore: bool = True,
+    progress: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute MPF features from continuous EMG for alignment.
 
@@ -180,8 +181,18 @@ def multivariate_power_frequency_features(
     )
 
     feature_chunks = []
+    num_chunks = int(np.ceil(len(output_frame_indices) / chunk_output_frames))
     with torch.no_grad():
-        for chunk_start in range(0, len(output_frame_indices), chunk_output_frames):
+        for chunk_number, chunk_start in enumerate(
+            range(0, len(output_frame_indices), chunk_output_frames), start=1
+        ):
+            if progress:
+                print(
+                    "Computing MPF chunk "
+                    f"{chunk_number}/{num_chunks} "
+                    f"({chunk_start}/{len(output_frame_indices)} frames)",
+                    flush=True,
+                )
             chunk_indices = output_frame_indices[
                 chunk_start : chunk_start + chunk_output_frames
             ]

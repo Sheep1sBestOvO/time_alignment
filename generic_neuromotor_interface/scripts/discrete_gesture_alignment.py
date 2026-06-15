@@ -618,11 +618,17 @@ def simulate_shift_eval(
         )
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    click.echo(f"Loading HDF5: {hdf5_path}", err=True)
     timeseries, prompts = load_discrete_gesture_hdf5(hdf5_path)
     prompts = prompts.sort_values("time").reset_index(drop=True)
     selected = prompts.iloc[prompt_start : prompt_start + num_prompts].copy()
     if len(selected) == 0:
         raise click.BadParameter("No prompts selected")
+    click.echo(
+        f"Selected {len(selected)} prompts "
+        f"from index {prompt_start} to {prompt_start + len(selected) - 1}",
+        err=True,
+    )
 
     rng = np.random.default_rng(seed)
     shifts = rng.uniform(shift_range[0], shift_range[1], size=len(selected))
@@ -631,9 +637,20 @@ def simulate_shift_eval(
     shifted_prompts["random_shift_seconds"] = shifts
     shifted_prompts["time"] = shifted_prompts["ground_truth_time"] + shifts
     shifted_prompts["original_prompt_index"] = selected.index.to_numpy(dtype=int)
+    click.echo(
+        "Created simulated shifted labels: "
+        f"range=({shifts.min():+.3f}, {shifts.max():+.3f})s, "
+        f"mean={shifts.mean():+.3f}s",
+        err=True,
+    )
 
     times = timeseries["time"]
     sample_rate = infer_sample_rate(times)
+    click.echo(
+        f"Preparing {feature} features from {len(timeseries):,} EMG samples "
+        f"at {sample_rate:.1f} Hz",
+        err=True,
+    )
     if feature == "mpf":
         features, feature_times = multivariate_power_frequency_features(
             timeseries["emg"],
@@ -644,13 +661,25 @@ def simulate_shift_eval(
             fft_stride=mpf_fft_stride,
             fs=sample_rate,
             chunk_output_frames=mpf_chunk_output_frames,
+            progress=True,
         )
     else:
         features = emg_envelope_features(
             timeseries["emg"], sample_rate=sample_rate, smoothing_ms=smoothing_ms
         )
         feature_times = times
+    click.echo(
+        f"Feature matrix ready: shape={features.shape}, "
+        f"time_points={len(feature_times):,}",
+        err=True,
+    )
 
+    click.echo(
+        "Running time alignment: "
+        f"template_estimator={template_estimator}, iterations={iterations}, "
+        f"beam_width={beam_width}, candidate_step={candidate_step}s",
+        err=True,
+    )
     aligned, _ = align_prompt_times(
         features=features,
         times=feature_times,
@@ -668,6 +697,7 @@ def simulate_shift_eval(
         min_event_separation_s=min_event_separation,
         prompt_prior_weight=prompt_prior_weight,
     )
+    click.echo("Alignment finished. Computing errors against ground truth.", err=True)
 
     shifted_by_index = shifted_prompts.sort_index()
     aligned = aligned.sort_index().copy()
@@ -696,6 +726,7 @@ def simulate_shift_eval(
     shifted_prompts.to_csv(shifted_csv, index=False)
     aligned.to_csv(aligned_csv, index=False)
     _write_simulation_metrics(aligned, metrics_csv)
+    click.echo("Writing multi-channel SVG visualization.", err=True)
     _write_multichannel_simulation_svg(
         plot_svg,
         timeseries,
