@@ -696,6 +696,7 @@ def simulate_shift_eval(
         enforce_monotonic=True,
         min_event_separation_s=min_event_separation,
         prompt_prior_weight=prompt_prior_weight,
+        progress=True,
     )
     click.echo("Alignment finished. Computing errors against ground truth.", err=True)
 

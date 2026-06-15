@@ -604,6 +604,7 @@ def align_prompt_times(
     enforce_monotonic: bool = True,
     min_event_separation_s: float = 0.0,
     prompt_prior_weight: float = 0.0,
+    progress: bool = False,
 ) -> tuple[pd.DataFrame, TemplateBank]:
     """Iteratively align discrete gesture prompts to continuous features.
 
@@ -626,6 +627,12 @@ def align_prompt_times(
 
     templates: TemplateBank | None = None
     for iteration in range(max_iterations):
+        if progress:
+            print(
+                f"[align] iteration {iteration + 1}/{max_iterations}: "
+                f"estimating templates ({template_estimator})",
+                flush=True,
+            )
         templates = estimate_templates(
             features,
             times,
@@ -639,8 +646,15 @@ def align_prompt_times(
         if recenter_templates:
             templates = recenter_template_bank(templates)
         previous = aligned["aligned_time"].to_numpy(dtype=float).copy()
+        sequences = group_overlapping_sequences(aligned, uncertainty_window)
+        if progress:
+            print(
+                f"[align] iteration {iteration + 1}/{max_iterations}: "
+                f"aligning {len(sequences)} sequences via beam search",
+                flush=True,
+            )
         pieces = []
-        for sequence in group_overlapping_sequences(aligned, uncertainty_window):
+        for seq_idx, sequence in enumerate(sequences, start=1):
             pieces.append(
                 _align_sequence(
                     features=features,
@@ -655,10 +669,28 @@ def align_prompt_times(
                     prompt_prior_weight=prompt_prior_weight,
                 )
             )
+            if progress and (seq_idx % 100 == 0 or seq_idx == len(sequences)):
+                print(
+                    f"[align]   iter {iteration + 1}: "
+                    f"{seq_idx}/{len(sequences)} sequences aligned",
+                    flush=True,
+                )
         aligned = pd.concat(pieces, axis=0).sort_index()
         update = np.max(np.abs(aligned["aligned_time"].to_numpy(dtype=float) - previous))
         aligned["alignment_iteration"] = iteration + 1
+        if progress:
+            print(
+                f"[align] iteration {iteration + 1}/{max_iterations}: "
+                f"max timestamp update = {update:.4f}s "
+                f"(tolerance {tolerance_s:.4f}s)",
+                flush=True,
+            )
         if update < tolerance_s:
+            if progress:
+                print(
+                    f"[align] converged after {iteration + 1} iterations",
+                    flush=True,
+                )
             break
 
     if templates is None:
