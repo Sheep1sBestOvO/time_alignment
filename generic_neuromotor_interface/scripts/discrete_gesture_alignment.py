@@ -1352,6 +1352,13 @@ def _compute_features_for_session(
 @click.option("--mpf-n-fft", type=int, default=64, show_default=True)
 @click.option("--mpf-fft-stride", type=int, default=10, show_default=True)
 @click.option("--mpf-chunk-output-frames", type=int, default=4096, show_default=True)
+@click.option(
+    "--oracle-init/--no-oracle-init",
+    default=False,
+    show_default=True,
+    help="Seed each session's EM first iteration with oracle templates (from "
+    "ground truth). Isolates the global-recenter step from cold-start EM failure.",
+)
 def multi_session_recenter_eval(
     hdf5_paths: tuple[Path, ...],
     output_dir: Path,
@@ -1376,6 +1383,7 @@ def multi_session_recenter_eval(
     mpf_n_fft: int,
     mpf_fft_stride: int,
     mpf_chunk_output_frames: int,
+    oracle_init: bool,
 ) -> None:
     """Validate the full pipeline: inject DIFFERENT systematic offsets per session,
     align each with EM, then run global recentering and check whether the
@@ -1428,6 +1436,16 @@ def multi_session_recenter_eval(
             mpf_chunk_output_frames,
         )
 
+        init_bank = None
+        if oracle_init:
+            click.echo("  seeding EM with oracle templates (from ground truth)", err=True)
+            truth = shifted.copy()
+            truth["time"] = truth["ground_truth_time"].to_numpy(dtype=float)
+            init_bank = estimate_templates(
+                features, feature_times, truth, pre, post,
+                aligned_time_col="time", method=template_estimator, ridge=template_ridge,
+            )
+
         aligned, templates = align_prompt_times(
             features=features,
             times=feature_times,
@@ -1444,6 +1462,7 @@ def multi_session_recenter_eval(
             enforce_monotonic=True,
             min_event_separation_s=min_event_separation,
             progress=True,
+            init_templates=init_bank,
         )
         aligned_tables[session_id] = aligned
         template_banks[session_id] = templates
