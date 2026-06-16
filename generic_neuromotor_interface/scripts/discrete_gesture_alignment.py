@@ -1588,5 +1588,162 @@ def multi_session_recenter_eval(
     click.echo(f"\nSaved summary to {summary_csv}")
 
 
+_SCROLL_HTML_TEMPLATE = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>__TITLE__</title>
+<style>
+ body{font-family:-apple-system,Arial,sans-serif;margin:16px;color:#111827;}
+ #wrap{max-width:1500px;}
+ canvas{border:1px solid #d1d5db;background:#f9fafb;width:100%;height:auto;}
+ .row{margin:10px 0;}
+ input[type=range]{width:100%;}
+ .legend span{margin-right:18px;font-size:13px;}
+ .sw{display:inline-block;width:24px;height:3px;vertical-align:middle;margin-right:5px;}
+ #info{font-size:13px;color:#4b5563;}
+</style></head><body><div id="wrap">
+<h2>__TITLE__</h2>
+<div class="legend">
+ <span><i class="sw" style="background:#16a34a"></i>ground truth</span>
+ <span><i class="sw" style="background:#2563eb"></i>shifted prompt (input)</span>
+ <span><i class="sw" style="background:#dc2626"></i>aligned (recovered)</span>
+</div>
+<canvas id="cv" width="1460" height="620"></canvas>
+<div class="row"><input id="sl" type="range" min="0" max="100" value="0" step="0.1"></div>
+<div id="info"></div>
+</div>
+<script>
+const DATA = __DATA__;
+const CFG = __CONFIG__;
+const cv=document.getElementById('cv'), ctx=cv.getContext('2d');
+const sl=document.getElementById('sl'), info=document.getElementById('info');
+const W=cv.width,H=cv.height, ML=70,MR=20,MT=20,MB=40;
+const PW=W-ML-MR, PH=H-MT-MB;
+const T=DATA.t, CH=DATA.ch, nCh=CH.length, win=CFG.window;
+const tmax=T[T.length-1];
+sl.max=Math.max(0, tmax-win); sl.value=0;
+function lerpX(t,t0){return ML+(t-t0)/win*PW;}
+function draw(){
+ const t0=parseFloat(sl.value), t1=t0+win;
+ ctx.clearRect(0,0,W,H);
+ // time grid
+ ctx.strokeStyle='#e5e7eb'; ctx.fillStyle='#6b7280'; ctx.font='11px Arial'; ctx.lineWidth=1;
+ for(let s=Math.ceil(t0*2)/2; s<=t1; s+=0.5){ const x=lerpX(s,t0);
+   ctx.beginPath();ctx.moveTo(x,MT);ctx.lineTo(x,MT+PH);ctx.stroke();
+   ctx.fillText(s.toFixed(1)+'s', x-12, MT+PH+16);}
+ // find sample index range
+ let i0=0,i1=T.length-1;
+ while(i0<T.length && T[i0]<t0)i0++; while(i1>0 && T[i1]>t1)i1--;
+ const laneH=PH/nCh;
+ for(let c=0;c<nCh;c++){ const base=MT+(c+0.5)*laneH, amp=laneH*0.46;
+   ctx.strokeStyle='#94a3b8'; ctx.fillStyle='#6b7280';
+   ctx.fillText('ch'+String(c).padStart(2,'0'), 6, base+3);
+   ctx.strokeStyle=CFG.colors[c%CFG.colors.length]; ctx.lineWidth=0.8; ctx.beginPath();
+   let started=false;
+   for(let i=i0;i<=i1;i++){ const x=lerpX(T[i],t0); let y=CH[c][i]; if(y>1.5)y=1.5; if(y<-1.5)y=-1.5;
+     const py=base-amp*(y/1.5); if(!started){ctx.moveTo(x,py);started=true;}else ctx.lineTo(x,py);}
+   ctx.stroke();
+ }
+ // events
+ const ev=DATA.ev; let shown=0;
+ function vline(t,color,dash,label,ypos){ if(t<t0||t>t1)return; const x=lerpX(t,t0);
+   ctx.strokeStyle=color; ctx.lineWidth=2; ctx.setLineDash(dash?[5,4]:[]);
+   ctx.beginPath();ctx.moveTo(x,MT);ctx.lineTo(x,MT+PH);ctx.stroke(); ctx.setLineDash([]);
+   if(label){ctx.fillStyle=color; ctx.font='10px Arial'; ctx.save(); ctx.translate(x+3,ypos); ctx.rotate(-0.42); ctx.fillText(label,0,0); ctx.restore();}}
+ for(const e of ev){
+   const inwin = (e.gt>=t0&&e.gt<=t1)||(e.pr>=t0&&e.pr<=t1)||(e.al>=t0&&e.al<=t1);
+   if(!inwin)continue; shown++;
+   vline(e.pr,'#2563eb',true,'',0);
+   if(e.gt!=null) vline(e.gt,'#16a34a',false,e.name,MT+14);
+   vline(e.al,'#dc2626',false,'',0);
+ }
+ info.textContent='window '+t0.toFixed(2)+'–'+t1.toFixed(2)+'s of '+tmax.toFixed(1)+'s | events in view: '+shown
+   +' | abs time start '+(CFG.t_abs0+t0).toFixed(3)+'s';
+}
+sl.addEventListener('input',draw); draw();
+</script></body></html>"""
+
+
+@main.command("plot-scroll")
+@click.argument("hdf5_path", type=click.Path(exists=True, path_type=Path))
+@click.argument("aligned_csv", type=click.Path(exists=True, path_type=Path))
+@click.argument("output_html", type=click.Path(path_type=Path))
+@click.option("--start", type=float, default=0.0, show_default=True,
+              help="Start time (s, relative to recording start) of the embedded segment.")
+@click.option("--duration", type=float, default=60.0, show_default=True,
+              help="Seconds of recording to embed (slider scrolls within this). "
+              "Larger = bigger HTML. Use a modest value to keep the file small.")
+@click.option("--window", type=float, default=5.0, show_default=True,
+              help="Visible window width in seconds.")
+@click.option("--display-hz", type=float, default=250.0, show_default=True,
+              help="Downsample EMG to this rate for display (smaller = lighter file).")
+def plot_scroll(
+    hdf5_path: Path,
+    aligned_csv: Path,
+    output_html: Path,
+    start: float,
+    duration: float,
+    window: float,
+    display_hz: float,
+) -> None:
+    """Interactive scrollable viewer: a multichannel sEMG segment with a slider,
+    showing each gesture's shifted prompt (blue), ground truth (green) and aligned
+    (red) time. Produces a self-contained HTML file (open in a browser)."""
+
+    import json
+
+    timeseries, _ = load_discrete_gesture_hdf5(hdf5_path)
+    raw_times = timeseries["time"].astype(float)
+    t_abs0 = float(raw_times[0])
+    rel = raw_times - t_abs0
+    t1 = start + duration
+    i0, i1 = np.searchsorted(rel, [start, t1])
+    if i1 <= i0:
+        raise click.BadParameter("Selected --start/--duration has no samples")
+
+    seg_emg = timeseries["emg"][i0:i1].astype(float)
+    seg_t = rel[i0:i1] - start
+    sample_rate = infer_sample_rate(raw_times)
+    stride = max(1, int(round(sample_rate / display_hz)))
+    disp = _robust_multichannel_display(seg_emg)[::stride]
+    seg_t = seg_t[::stride]
+
+    aligned = pd.read_csv(aligned_csv)
+    has_gt = "ground_truth_time" in aligned.columns
+    tcol = "prompt_time" if "prompt_time" in aligned.columns else "time"
+    events = []
+    for row in aligned.itertuples():
+        pr = float(getattr(row, tcol)) - t_abs0 - start
+        al = float(getattr(row, "aligned_time")) - t_abs0 - start
+        gt = (float(getattr(row, "ground_truth_time")) - t_abs0 - start) if has_gt else None
+        if any(0 <= v <= duration for v in [pr, al] + ([gt] if gt is not None else [])):
+            events.append({"name": str(getattr(row, "name")), "pr": round(pr, 4),
+                           "al": round(al, 4), "gt": round(gt, 4) if gt is not None else None})
+
+    data = {
+        "t": [round(float(x), 4) for x in seg_t],
+        "ch": [[round(float(v), 3) for v in disp[:, c]] for c in range(disp.shape[1])],
+        "ev": events,
+    }
+    cfg = {
+        "window": window,
+        "t_abs0": t_abs0 + start,
+        "colors": ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b",
+                   "#e377c2", "#7f7f7f", "#bcbd22", "#17becf", "#60a5fa", "#fb923c",
+                   "#4ade80", "#f87171", "#c084fc", "#94a3b8"],
+    }
+    html_out = (
+        _SCROLL_HTML_TEMPLATE
+        .replace("__TITLE__", f"{hdf5_path.stem}  [{start:.0f}–{t1:.0f}s]")
+        .replace("__DATA__", json.dumps(data))
+        .replace("__CONFIG__", json.dumps(cfg))
+    )
+    output_html = Path(output_html)
+    output_html.parent.mkdir(parents=True, exist_ok=True)
+    output_html.write_text(html_out, encoding="utf-8")
+    click.echo(
+        f"Saved scrollable viewer to {output_html} "
+        f"({len(events)} events, {len(seg_t)} samples/ch, ~{output_html.stat().st_size//1024} KB)"
+    )
+
+
 if __name__ == "__main__":
     main()
