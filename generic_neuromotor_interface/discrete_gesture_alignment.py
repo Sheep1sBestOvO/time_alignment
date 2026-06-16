@@ -605,8 +605,16 @@ def align_prompt_times(
     min_event_separation_s: float = 0.0,
     prompt_prior_weight: float = 0.0,
     progress: bool = False,
+    init_templates: "TemplateBank | None" = None,
 ) -> tuple[pd.DataFrame, TemplateBank]:
     """Iteratively align discrete gesture prompts to continuous features.
+
+    ``init_templates`` optionally seeds the FIRST iteration with a given template
+    bank (e.g. an oracle bank estimated from ground-truth times) instead of
+    estimating templates from the current (perturbed) positions. Later iterations
+    re-estimate normally. This tests whether a good initialization lets EM
+    sustain a correct solution or whether it degrades back to the perturbed fixed
+    point.
 
     This implements the paper's EM-style generative inference: estimate
     gesture-specific templates from current event times (rERP), then re-infer
@@ -627,22 +635,31 @@ def align_prompt_times(
 
     templates: TemplateBank | None = None
     for iteration in range(max_iterations):
-        if progress:
-            print(
-                f"[align] iteration {iteration + 1}/{max_iterations}: "
-                f"estimating templates ({template_estimator})",
-                flush=True,
+        if iteration == 0 and init_templates is not None:
+            if progress:
+                print(
+                    "[align] iteration 1: using provided init_templates "
+                    "(seeding first iteration)",
+                    flush=True,
+                )
+            templates = init_templates
+        else:
+            if progress:
+                print(
+                    f"[align] iteration {iteration + 1}/{max_iterations}: "
+                    f"estimating templates ({template_estimator})",
+                    flush=True,
+                )
+            templates = estimate_templates(
+                features,
+                times,
+                aligned,
+                pre_s,
+                post_s,
+                aligned_time_col="aligned_time",
+                method=template_estimator,
+                ridge=template_ridge,
             )
-        templates = estimate_templates(
-            features,
-            times,
-            aligned,
-            pre_s,
-            post_s,
-            aligned_time_col="aligned_time",
-            method=template_estimator,
-            ridge=template_ridge,
-        )
         if recenter_templates:
             templates = recenter_template_bank(templates)
         previous = aligned["aligned_time"].to_numpy(dtype=float).copy()

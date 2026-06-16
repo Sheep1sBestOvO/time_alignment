@@ -608,6 +608,14 @@ def global_recenter(
     help="Also compute an oracle upper bound (templates built from ground-truth "
     "times) to separate the search core from template-estimation quality.",
 )
+@click.option(
+    "--oracle-init/--no-oracle-init",
+    default=False,
+    show_default=True,
+    help="Seed EM's FIRST iteration with oracle templates (built from ground "
+    "truth), then re-estimate normally. Tests whether a good init lets EM "
+    "sustain a correct solution or degrade back to the perturbed fixed point.",
+)
 def simulate_shift_eval(
     hdf5_path: Path,
     output_dir: Path,
@@ -641,6 +649,7 @@ def simulate_shift_eval(
     plot_right: float,
     recenter: bool,
     with_oracle: bool,
+    oracle_init: bool,
 ) -> None:
     """Randomly perturb event labels, align them, and evaluate against original labels.
 
@@ -754,6 +763,19 @@ def simulate_shift_eval(
         f"beam_width={beam_width}, candidate_step={candidate_step}s",
         err=True,
     )
+    init_bank = None
+    if oracle_init:
+        click.echo(
+            "Seeding EM iteration 1 with oracle templates (from ground truth).",
+            err=True,
+        )
+        truth = shifted_prompts.copy()
+        truth["time"] = truth["ground_truth_time"].to_numpy(dtype=float)
+        init_bank = estimate_templates(
+            features, feature_times, truth, pre, post,
+            aligned_time_col="time", method=template_estimator, ridge=template_ridge,
+        )
+
     aligned, _ = align_prompt_times(
         features=features,
         times=feature_times,
@@ -771,6 +793,7 @@ def simulate_shift_eval(
         min_event_separation_s=min_event_separation,
         prompt_prior_weight=prompt_prior_weight,
         progress=True,
+        init_templates=init_bank,
     )
     click.echo("Alignment finished. Computing errors against ground truth.", err=True)
 
