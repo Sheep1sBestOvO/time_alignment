@@ -1149,8 +1149,14 @@ def _validate_compatible_template_banks(
         raise ValueError("Template banks must have the same pre_samples")
     if first.post_samples != second.post_samples:
         raise ValueError("Template banks must have the same post_samples")
-    if not np.isclose(first.sample_rate, second.sample_rate):
-        raise ValueError("Template banks must have the same sample_rate")
+    # Sample rates inferred from per-session feature timestamps can differ by
+    # tiny floating-point amounts (e.g. 50.0025 vs 50.0031 Hz). Only flag banks
+    # whose rates differ enough to matter for shift<->seconds conversion.
+    if not np.isclose(first.sample_rate, second.sample_rate, rtol=1e-2, atol=1e-2):
+        raise ValueError(
+            f"Template banks must have the same sample_rate "
+            f"({first.sample_rate} vs {second.sample_rate})"
+        )
     shared = set(first.templates).intersection(second.templates)
     for name in shared:
         if first.templates[name].shape != second.templates[name].shape:
