@@ -1041,7 +1041,8 @@ def _write_multichannel_simulation_svg(
         f'font-weight="700" fill="{colors["text"]}">{html.escape(title)}</text>',
         f'<text x="{left_margin}" y="62" font-family="Arial" font-size="14" '
         f'fill="{colors["muted"]}">Raw sEMG is unchanged. Only event labels are '
-        "randomly shifted and then recovered by alignment.</text>",
+        "randomly shifted and then recovered by alignment. "
+        "Bold lines = focus event; faded thin lines = neighbouring gestures in window.</text>",
     ]
 
     for panel_idx, (_, row) in enumerate(examples.iterrows()):
@@ -1099,6 +1100,37 @@ def _write_multichannel_simulation_svg(
                 f'<text x="{x:.2f}" y="{plot_y + inner_h + 17}" '
                 f'font-family="Arial" font-size="10" text-anchor="middle" '
                 f'fill="{colors["muted"]}">{rel:+.1f}</text>'
+            )
+
+        # Faded thin lines for ALL OTHER events falling in this panel window, so
+        # consecutive/overlapping gestures are visible (the focus event stays bold).
+        main_idx = int(row["original_prompt_index"])
+        neighbours = aligned[
+            (aligned["ground_truth_time"] >= window_start)
+            & (aligned["ground_truth_time"] <= window_end)
+            & (aligned["original_prompt_index"] != main_idx)
+        ]
+        for _, nrow in neighbours.iterrows():
+            for nkey, ncolor in [
+                ("ground_truth_time", "ground_truth"),
+                ("prompt_time", "shifted"),
+                ("aligned_time", "aligned"),
+            ]:
+                nvalue = float(nrow[nkey])
+                if window_start <= nvalue <= window_end:
+                    nx = sx(nvalue)
+                    ndash = ' stroke-dasharray="4 4"' if ncolor == "shifted" else ""
+                    parts.append(
+                        f'<line x1="{nx:.2f}" x2="{nx:.2f}" y1="{plot_y}" '
+                        f'y2="{plot_y + inner_h}" stroke="{colors[ncolor]}" '
+                        f'stroke-width="1.0" opacity="0.30"{ndash}/>'
+                    )
+            ngx = sx(float(nrow["ground_truth_time"]))
+            parts.append(
+                f'<text x="{ngx + 2:.2f}" y="{plot_y + inner_h - 4:.2f}" '
+                f'font-family="Arial" font-size="8" fill="{colors["muted"]}" '
+                f'opacity="0.75">#{int(nrow["original_prompt_index"])} '
+                f'{html.escape(str(nrow["name"]))}</text>'
             )
 
         for key, color_key, label, dash in [
