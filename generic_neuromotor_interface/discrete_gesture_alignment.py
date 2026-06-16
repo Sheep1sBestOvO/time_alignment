@@ -606,8 +606,16 @@ def align_prompt_times(
     prompt_prior_weight: float = 0.0,
     progress: bool = False,
     init_templates: "TemplateBank | None" = None,
+    uncertainty_schedule: "Sequence[tuple[float, float]] | None" = None,
 ) -> tuple[pd.DataFrame, TemplateBank]:
     """Iteratively align discrete gesture prompts to continuous features.
+
+    ``uncertainty_schedule`` optionally runs coarse-to-fine annealing: a list of
+    search windows (narrow -> wide). Each stage runs the EM loop to convergence
+    (or ``max_iterations``) with that window, carrying the alignment forward.
+    Starting narrow keeps the cold-start template from scattering events; widening
+    later lets the (now sharper) template localize events that are further off.
+    If omitted, a single stage with ``uncertainty_window`` is used.
 
     ``init_templates`` optionally seeds the FIRST iteration with a given template
     bank (e.g. an oracle bank estimated from ground-truth times) instead of
@@ -633,82 +641,96 @@ def align_prompt_times(
     aligned["prompt_time"] = aligned["time"].to_numpy(dtype=float)
     aligned["aligned_time"] = aligned["prompt_time"]
 
+    schedule = list(uncertainty_schedule) if uncertainty_schedule else [uncertainty_window]
+
     templates: TemplateBank | None = None
-    for iteration in range(max_iterations):
-        if iteration == 0 and init_templates is not None:
-            if progress:
-                print(
-                    "[align] iteration 1: using provided init_templates "
-                    "(seeding first iteration)",
-                    flush=True,
-                )
-            templates = init_templates
-        else:
-            if progress:
-                print(
-                    f"[align] iteration {iteration + 1}/{max_iterations}: "
-                    f"estimating templates ({template_estimator})",
-                    flush=True,
-                )
-            templates = estimate_templates(
-                features,
-                times,
-                aligned,
-                pre_s,
-                post_s,
-                aligned_time_col="aligned_time",
-                method=template_estimator,
-                ridge=template_ridge,
-            )
-        if recenter_templates:
-            templates = recenter_template_bank(templates)
-        previous = aligned["aligned_time"].to_numpy(dtype=float).copy()
-        sequences = group_overlapping_sequences(aligned, uncertainty_window)
-        if progress:
+    first_iteration_overall = True
+    for stage_idx, stage_window in enumerate(schedule):
+        if progress and len(schedule) > 1:
             print(
-                f"[align] iteration {iteration + 1}/{max_iterations}: "
-                f"aligning {len(sequences)} sequences via beam search",
+                f"[align] === stage {stage_idx + 1}/{len(schedule)}: "
+                f"uncertainty window {stage_window} ===",
                 flush=True,
             )
-        pieces = []
-        for seq_idx, sequence in enumerate(sequences, start=1):
-            pieces.append(
-                _align_sequence(
-                    features=features,
-                    times=times,
-                    sequence=sequence,
-                    templates=templates,
-                    uncertainty_window=uncertainty_window,
-                    beam_width=beam_width,
-                    candidate_step_s=candidate_step_s,
-                    enforce_monotonic=enforce_monotonic,
-                    min_event_separation_s=min_event_separation_s,
-                    prompt_prior_weight=prompt_prior_weight,
+        for iteration in range(max_iterations):
+            if first_iteration_overall and init_templates is not None:
+                if progress:
+                    print(
+                        "[align] iteration 1: using provided init_templates "
+                        "(seeding first iteration)",
+                        flush=True,
+                    )
+                templates = init_templates
+            else:
+                if progress:
+                    print(
+                        f"[align] stage {stage_idx + 1} iter {iteration + 1}/"
+                        f"{max_iterations}: estimating templates ({template_estimator})",
+                        flush=True,
+                    )
+                templates = estimate_templates(
+                    features,
+                    times,
+                    aligned,
+                    pre_s,
+                    post_s,
+                    aligned_time_col="aligned_time",
+                    method=template_estimator,
+                    ridge=template_ridge,
                 )
-            )
-            if progress and (seq_idx % 100 == 0 or seq_idx == len(sequences)):
-                print(
-                    f"[align]   iter {iteration + 1}: "
-                    f"{seq_idx}/{len(sequences)} sequences aligned",
-                    flush=True,
-                )
-        aligned = pd.concat(pieces, axis=0).sort_index()
-        update = np.max(np.abs(aligned["aligned_time"].to_numpy(dtype=float) - previous))
-        aligned["alignment_iteration"] = iteration + 1
-        if progress:
-            print(
-                f"[align] iteration {iteration + 1}/{max_iterations}: "
-                f"max timestamp update = {update:.4f}s "
-                f"(tolerance {tolerance_s:.4f}s)",
-                flush=True,
-            )
-        if update < tolerance_s:
+            first_iteration_overall = False
+            if recenter_templates:
+                templates = recenter_template_bank(templates)
+            previous = aligned["aligned_time"].to_numpy(dtype=float).copy()
+            sequences = group_overlapping_sequences(aligned, stage_window)
             if progress:
                 print(
-                    f"[align] converged after {iteration + 1} iterations",
+                    f"[align] stage {stage_idx + 1} iter {iteration + 1}/"
+                    f"{max_iterations}: aligning {len(sequences)} sequences",
                     flush=True,
                 )
-            break
+            pieces = []
+            for seq_idx, sequence in enumerate(sequences, start=1):
+                pieces.append(
+                    _align_sequence(
+                        features=features,
+                        times=times,
+                        sequence=sequence,
+                        templates=templates,
+                        uncertainty_window=stage_window,
+                        beam_width=beam_width,
+                        candidate_step_s=candidate_step_s,
+                        enforce_monotonic=enforce_monotonic,
+                        min_event_separation_s=min_event_separation_s,
+                        prompt_prior_weight=prompt_prior_weight,
+                    )
+                )
+                if progress and (seq_idx % 200 == 0 or seq_idx == len(sequences)):
+                    print(
+                        f"[align]   stage {stage_idx + 1} iter {iteration + 1}: "
+                        f"{seq_idx}/{len(sequences)} sequences aligned",
+                        flush=True,
+                    )
+            aligned = pd.concat(pieces, axis=0).sort_index()
+            update = np.max(
+                np.abs(aligned["aligned_time"].to_numpy(dtype=float) - previous)
+            )
+            aligned["alignment_iteration"] = iteration + 1
+            if progress:
+                print(
+                    f"[align] stage {stage_idx + 1} iter {iteration + 1}/"
+                    f"{max_iterations}: max update = {update:.4f}s "
+                    f"(tolerance {tolerance_s:.4f}s)",
+                    flush=True,
+                )
+            if update < tolerance_s:
+                if progress:
+                    print(
+                        f"[align] stage {stage_idx + 1} converged after "
+                        f"{iteration + 1} iterations",
+                        flush=True,
+                    )
+                break
 
     if templates is None:
         raise ValueError("max_iterations must be at least 1")

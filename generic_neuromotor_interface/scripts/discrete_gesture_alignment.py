@@ -616,6 +616,15 @@ def global_recenter(
     "truth), then re-estimate normally. Tests whether a good init lets EM "
     "sustain a correct solution or degrade back to the perturbed fixed point.",
 )
+@click.option(
+    "--coarse-to-fine",
+    type=int,
+    default=0,
+    show_default=True,
+    help="If >0, anneal the search window over N stages from narrow to the full "
+    "--uncertainty target, to stop the cold-start template from scattering "
+    "events. 0 disables (single-stage).",
+)
 def simulate_shift_eval(
     hdf5_path: Path,
     output_dir: Path,
@@ -650,6 +659,7 @@ def simulate_shift_eval(
     recenter: bool,
     with_oracle: bool,
     oracle_init: bool,
+    coarse_to_fine: int,
 ) -> None:
     """Randomly perturb event labels, align them, and evaluate against original labels.
 
@@ -763,6 +773,18 @@ def simulate_shift_eval(
         f"beam_width={beam_width}, candidate_step={candidate_step}s",
         err=True,
     )
+    uncertainty_schedule = None
+    if coarse_to_fine > 0:
+        uncertainty_schedule = [
+            (uncertainty[0] * k / coarse_to_fine, uncertainty[1] * k / coarse_to_fine)
+            for k in range(1, coarse_to_fine + 1)
+        ]
+        click.echo(
+            f"Coarse-to-fine annealing over {coarse_to_fine} stages: "
+            f"{[(round(a,3), round(b,3)) for a, b in uncertainty_schedule]}",
+            err=True,
+        )
+
     init_bank = None
     if oracle_init:
         click.echo(
@@ -794,6 +816,7 @@ def simulate_shift_eval(
         prompt_prior_weight=prompt_prior_weight,
         progress=True,
         init_templates=init_bank,
+        uncertainty_schedule=uncertainty_schedule,
     )
     click.echo("Alignment finished. Computing errors against ground truth.", err=True)
 
