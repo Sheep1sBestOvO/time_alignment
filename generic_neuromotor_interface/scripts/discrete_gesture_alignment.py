@@ -1043,15 +1043,19 @@ def _write_multichannel_simulation_svg(
     left_s: float,
     right_s: float,
     title: str,
+    examples: "pd.DataFrame | None" = None,
 ) -> None:
-    if max_prompts <= 0 or len(aligned) == 0:
+    if len(aligned) == 0:
         return
     if left_s <= 0 or right_s <= 0:
         raise click.BadParameter("plot-left and plot-right must be positive")
 
-    examples = aligned.sort_values("abs_error_before", ascending=False).head(
-        max_prompts
-    )
+    if examples is None:
+        if max_prompts <= 0:
+            return
+        examples = aligned.sort_values("abs_error_before", ascending=False).head(
+            max_prompts
+        )
     raw_times = timeseries["time"]
     raw_emg = timeseries["emg"]
 
@@ -1920,6 +1924,47 @@ def window_sweep(
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     out.to_csv(output_csv, index=False)
     click.echo(f"Saved {len(out)} rows ({len(combos)} combos) to {output_csv}")
+
+
+@main.command("plot-per-gesture")
+@click.argument("hdf5_path", type=click.Path(exists=True, path_type=Path))
+@click.argument("aligned_csv", type=click.Path(exists=True, path_type=Path))
+@click.argument("output_svg", type=click.Path(path_type=Path))
+@click.option("--per-gesture", type=int, default=2, show_default=True,
+              help="Number of example events to show per gesture.")
+@click.option("--plot-left", type=float, default=0.8, show_default=True)
+@click.option("--plot-right", type=float, default=0.8, show_default=True)
+@click.option("--pick", type=click.Choice(["hardest", "random", "spread"]),
+              default="spread", show_default=True,
+              help="hardest=largest injected shift; random; spread=range of after-error.")
+@click.option("--seed", type=int, default=0, show_default=True)
+def plot_per_gesture(hdf5_path, aligned_csv, output_svg, per_gesture, plot_left,
+                     plot_right, pick, seed) -> None:
+    """Multichannel SVG showing N example events PER GESTURE (shift/gt/aligned),
+    so you can eyeball alignment quality for every gesture class."""
+    timeseries, _ = load_discrete_gesture_hdf5(hdf5_path)
+    aligned = pd.read_csv(aligned_csv)
+    rng = np.random.default_rng(seed)
+    picks = []
+    for name, g in aligned.groupby("name"):
+        g = g.copy()
+        if pick == "hardest":
+            sel = g.nlargest(per_gesture, "abs_error_before")
+        elif pick == "random":
+            sel = g.sample(min(per_gesture, len(g)), random_state=seed)
+        else:  # spread: lowest + highest after-error + middles
+            g = g.sort_values("abs_error_after")
+            idx = np.linspace(0, len(g) - 1, min(per_gesture, len(g))).round().astype(int)
+            sel = g.iloc[idx]
+        picks.append(sel)
+    examples = pd.concat(picks).reset_index(drop=True)
+    _write_multichannel_simulation_svg(
+        Path(output_svg), timeseries, aligned, max_prompts=len(examples),
+        left_s=plot_left, right_s=plot_right,
+        title=f"{Path(hdf5_path).stem}: {per_gesture} examples/gesture ({pick})",
+        examples=examples,
+    )
+    click.echo(f"Saved {len(examples)} panels ({per_gesture}/gesture) to {output_svg}")
 
 
 if __name__ == "__main__":
