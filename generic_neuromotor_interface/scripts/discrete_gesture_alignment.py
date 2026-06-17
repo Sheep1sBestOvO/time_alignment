@@ -1745,5 +1745,140 @@ def plot_scroll(
     )
 
 
+def _load_or_compute_mpf(timeseries, fs, mpf_window_length, mpf_stride, mpf_n_fft,
+                         mpf_fft_stride, mpf_chunk_output_frames, cache_path):
+    """Compute MPF features once, or load from an .npz cache if present."""
+    if cache_path is not None and Path(cache_path).exists():
+        z = np.load(cache_path)
+        return z["features"], z["feature_times"]
+    features, feature_times = multivariate_power_frequency_features(
+        timeseries["emg"], timeseries["time"],
+        window_length=mpf_window_length, stride=mpf_stride, n_fft=mpf_n_fft,
+        fft_stride=mpf_fft_stride, fs=fs, chunk_output_frames=mpf_chunk_output_frames,
+        progress=True,
+    )
+    if cache_path is not None:
+        Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+        np.savez(cache_path, features=features, feature_times=feature_times)
+    return features, feature_times
+
+
+@main.command("window-sweep")
+@click.argument("hdf5_path", type=click.Path(exists=True, path_type=Path))
+@click.argument("output_csv", type=click.Path(path_type=Path))
+@click.option("--pre-min", type=float, default=0.1, show_default=True)
+@click.option("--pre-max", type=float, default=0.5, show_default=True)
+@click.option("--post-min", type=float, default=0.1, show_default=True)
+@click.option("--post-max", type=float, default=1.0, show_default=True)
+@click.option("--step", type=float, default=0.05, show_default=True)
+@click.option("--mpf-cache", type=click.Path(path_type=Path), default=None,
+              help="Path to .npz MPF cache (computed once, reused across windows).")
+@click.option("--build-cache-only", is_flag=True, default=False,
+              help="Only compute and save the MPF cache, then exit (run before array).")
+@click.option("--combo-start", type=int, default=0, show_default=True,
+              help="Index of first (pre,post) combo to process (for array jobs).")
+@click.option("--combo-count", type=int, default=0, show_default=True,
+              help="Number of combos to process from --combo-start (0 = all).")
+@click.option("--num-prompts", type=int, default=100000, show_default=True)
+@click.option("--shift-range", nargs=2, type=float, default=(-0.10, 0.10), show_default=True)
+@click.option("--uncertainty", nargs=2, type=float, default=(-0.12, 0.12), show_default=True)
+@click.option("--iterations", type=int, default=30, show_default=True)
+@click.option("--beam-width", type=int, default=30, show_default=True)
+@click.option("--candidate-step", type=float, default=0.02, show_default=True)
+@click.option("--min-event-separation", type=float, default=0.02, show_default=True)
+@click.option("--prompt-prior-weight", type=float, default=0.1, show_default=True)
+@click.option("--template-estimator", type=click.Choice(["rerp", "average"]),
+              default="rerp", show_default=True)
+@click.option("--template-ridge", type=float, default=1e-3, show_default=True)
+@click.option("--seed", type=int, default=0, show_default=True)
+@click.option("--mpf-window-length", type=int, default=200, show_default=True)
+@click.option("--mpf-stride", type=int, default=40, show_default=True)
+@click.option("--mpf-n-fft", type=int, default=64, show_default=True)
+@click.option("--mpf-fft-stride", type=int, default=10, show_default=True)
+@click.option("--mpf-chunk-output-frames", type=int, default=4096, show_default=True)
+def window_sweep(
+    hdf5_path, output_csv, pre_min, pre_max, post_min, post_max, step,
+    mpf_cache, build_cache_only, combo_start, combo_count,
+    num_prompts, shift_range, uncertainty, iterations, beam_width, candidate_step,
+    min_event_separation, prompt_prior_weight, template_estimator, template_ridge, seed,
+    mpf_window_length, mpf_stride, mpf_n_fft, mpf_fft_stride, mpf_chunk_output_frames,
+) -> None:
+    """Sweep (pre, post) template windows on a fixed MPF cache and record per-gesture
+    alignment error for each window, to find the best window per gesture.
+
+    MPF is computed once (cached). Each (pre, post) combo runs the EM alignment
+    (using a fixed injected shift) and records per-gesture median/mean abs error
+    after alignment and the oracle upper bound."""
+
+    timeseries, prompts = load_discrete_gesture_hdf5(hdf5_path)
+    fs = infer_sample_rate(timeseries["time"])
+
+    features, feature_times = _load_or_compute_mpf(
+        timeseries, fs, mpf_window_length, mpf_stride, mpf_n_fft,
+        mpf_fft_stride, mpf_chunk_output_frames, mpf_cache,
+    )
+    click.echo(f"MPF ready: {features.shape}", err=True)
+    if build_cache_only:
+        click.echo("Cache built; exiting (--build-cache-only).", err=True)
+        return
+
+    prompts = prompts.sort_values("time").reset_index(drop=True)
+    selected = prompts.iloc[:num_prompts].copy()
+    gt = selected["time"].to_numpy(dtype=float)
+    rng = np.random.default_rng(seed)
+    shift = rng.uniform(shift_range[0], shift_range[1], size=len(selected))
+    shifted = selected.copy()
+    shifted["ground_truth_time"] = gt
+    shifted["time"] = gt + shift
+    shifted["original_prompt_index"] = selected.index.to_numpy(dtype=int)
+    prompts_in = shifted[["name", "time", "ground_truth_time", "original_prompt_index"]]
+
+    def frange(a, b):
+        n = int(round((b - a) / step)) + 1
+        return [round(a + i * step, 4) for i in range(n)]
+
+    combos = [(p, q) for p in frange(pre_min, pre_max) for q in frange(post_min, post_max)]
+    if combo_count > 0:
+        combos = combos[combo_start:combo_start + combo_count]
+    else:
+        combos = combos[combo_start:]
+    click.echo(f"Processing {len(combos)} (pre,post) combos", err=True)
+
+    rows = []
+    for ci, (pre, post) in enumerate(combos, start=1):
+        click.echo(f"[sweep] {ci}/{len(combos)}  pre={pre} post={post}", err=True)
+        aligned, _ = align_prompt_times(
+            features=features, times=feature_times, prompts=prompts_in,
+            pre_s=pre, post_s=post, uncertainty_window=uncertainty,
+            max_iterations=iterations, beam_width=beam_width,
+            candidate_step_s=candidate_step, recenter_templates=False,
+            template_estimator=template_estimator, template_ridge=template_ridge,
+            enforce_monotonic=True, min_event_separation_s=min_event_separation,
+            prompt_prior_weight=prompt_prior_weight, progress=False,
+        )
+        aligned = aligned.sort_index()
+        gt_a = aligned["ground_truth_time"].to_numpy(dtype=float)
+        err_after = np.abs(aligned["aligned_time"].to_numpy(dtype=float) - gt_a)
+        oracle_t = _oracle_align_times(
+            features, feature_times, aligned, pre, post, uncertainty, candidate_step
+        )
+        err_oracle = np.abs(oracle_t - gt_a)
+        tmp = pd.DataFrame({"name": aligned["name"].astype(str).to_numpy(),
+                            "err_after": err_after, "err_oracle": err_oracle})
+        for name, grp in tmp.groupby("name"):
+            rows.append({
+                "pre": pre, "post": post, "name": name, "n": len(grp),
+                "median_after": float(grp["err_after"].median()),
+                "mae_after": float(grp["err_after"].mean()),
+                "median_oracle": float(grp["err_oracle"].median()),
+            })
+
+    out = pd.DataFrame(rows)
+    output_csv = Path(output_csv)
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(output_csv, index=False)
+    click.echo(f"Saved {len(out)} rows ({len(combos)} combos) to {output_csv}")
+
+
 if __name__ == "__main__":
     main()
