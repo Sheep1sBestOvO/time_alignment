@@ -739,6 +739,217 @@ def align_prompt_times(
     return aligned, templates
 
 
+@dataclass(frozen=True)
+class AdaptiveTemplateBank:
+    """Templates with a PER-GESTURE time window (pre/post samples)."""
+
+    templates: dict[str, np.ndarray]
+    window_samples: dict[str, tuple[int, int]]  # name -> (pre_n, post_n)
+    sample_rate: float
+
+    def pre(self, name: str) -> int:
+        return self.window_samples[name][0]
+
+    def length(self, name: str) -> int:
+        pre_n, post_n = self.window_samples[name]
+        return pre_n + post_n
+
+
+def _estimate_adaptive_templates(
+    features: np.ndarray,
+    times: np.ndarray,
+    prompts: pd.DataFrame,
+    window_samples: dict[str, tuple[int, int]],
+    sample_rate: float,
+    aligned_time_col: str,
+    method: str,
+    ridge: float,
+) -> AdaptiveTemplateBank:
+    features = np.asarray(features, dtype=np.float64)
+    time_col = aligned_time_col if aligned_time_col in prompts.columns else "time"
+    names = [str(n) for n in prompts["name"].drop_duplicates() if str(n) in window_samples]
+
+    if method == "average":
+        templates: dict[str, np.ndarray] = {}
+        for name, group in prompts.groupby("name", sort=False):
+            name = str(name)
+            if name not in window_samples:
+                continue
+            pre_n, post_n = window_samples[name]
+            windows = []
+            for et in group[time_col].to_numpy(dtype=float):
+                c = int(np.searchsorted(times, et))
+                s, e = c - pre_n, c + post_n
+                if s < 0 or e > len(features):
+                    continue
+                windows.append(features[s:e])
+            if windows:
+                templates[name] = np.mean(np.stack(windows, axis=0), axis=0)
+        if not templates:
+            raise ValueError("No adaptive templates could be estimated")
+        return AdaptiveTemplateBank(templates, window_samples, sample_rate)
+
+    # rERP with per-gesture (variable-length) lag regressors
+    from scipy import sparse
+
+    lengths = {n: window_samples[n][0] + window_samples[n][1] for n in names}
+    offsets: dict[str, int] = {}
+    off = 0
+    for n in names:
+        offsets[n] = off
+        off += lengths[n]
+    total = off
+    if total > 20000:
+        raise ValueError(f"adaptive rERP would create {total} params; reduce windows")
+    rows, cols = [], []
+    for row in prompts.itertuples():
+        name = str(row.name)
+        if name not in window_samples:
+            continue
+        c = int(np.searchsorted(times, float(getattr(row, time_col))))
+        pre_n, post_n = window_samples[name]
+        s, e = c - pre_n, c + post_n
+        if s < 0 or e > len(features):
+            continue
+        rows.append(np.arange(s, e, dtype=np.int64))
+        cols.append(offsets[name] + np.arange(lengths[name], dtype=np.int64))
+    if not rows:
+        raise ValueError("No valid events for adaptive rERP")
+    drows = np.concatenate(rows)
+    dcols = np.concatenate(cols)
+    ddata = np.ones(len(drows), dtype=np.float64)
+    ncol = total + 1  # intercept
+    drows = np.concatenate([drows, np.arange(len(features), dtype=np.int64)])
+    dcols = np.concatenate([dcols, np.full(len(features), total, dtype=np.int64)])
+    ddata = np.concatenate([ddata, np.ones(len(features), dtype=np.float64)])
+    design = sparse.coo_matrix((ddata, (drows, dcols)), shape=(len(features), ncol)).tocsr()
+    xtx = (design.T @ design).toarray()
+    if ridge > 0:
+        reg = np.full(ncol, ridge, dtype=np.float64)
+        reg[-1] = 0.0
+        xtx.flat[:: ncol + 1] += reg
+    xty = design.T @ features
+    coef = np.linalg.solve(xtx, xty)[:total]
+    templates = {n: coef[offsets[n]: offsets[n] + lengths[n]] for n in names}
+    return AdaptiveTemplateBank(templates, window_samples, sample_rate)
+
+
+def _subtract_template_adaptive(residual, residual_start_idx, center_idx, template, pre_n):
+    start = center_idx - pre_n
+    stop = start + len(template)
+    a = max(start, residual_start_idx)
+    b = min(stop, residual_start_idx + len(residual))
+    if a >= b:
+        return
+    ts = a - start
+    rs = a - residual_start_idx
+    residual[rs: rs + (b - a)] -= template[ts: ts + (b - a)]
+
+
+def _align_single_event_adaptive(features, times, sequence, bank, uncertainty_window, candidate_step_s):
+    row = sequence.iloc[0]
+    name = str(row["name"])
+    template = bank.templates[name]
+    pre_n = bank.pre(name)
+    L = bank.length(name)
+    candidates = _candidate_indices(
+        times, float(row["prompt_time"]), uncertainty_window[0], uncertainty_window[1],
+        candidate_step_s, bank.sample_rate,
+    )
+    best_cost, best_idx = np.inf, int(np.searchsorted(times, float(row["prompt_time"])))
+    for c in candidates:
+        c = int(c); s = c - pre_n; e = s + L
+        if s < 0 or e > len(features):
+            continue
+        cost = float(np.sum((features[s:e] - template) ** 2))
+        if cost < best_cost:
+            best_cost, best_idx = cost, c
+    aligned = sequence.copy()
+    aligned["aligned_time"] = float(times[best_idx])
+    return aligned
+
+
+def _align_sequence_adaptive(features, times, sequence, bank, uncertainty_window,
+                             beam_width, candidate_step_s, enforce_monotonic,
+                             min_event_separation_s, prompt_prior_weight):
+    if len(sequence) == 1:
+        return _align_single_event_adaptive(
+            features, times, sequence, bank, uncertainty_window, candidate_step_s)
+    lower, upper = uncertainty_window
+    cand_list = [
+        _candidate_indices(times, float(r.prompt_time), lower, upper, candidate_step_s, bank.sample_rate)
+        for r in sequence.itertuples()
+    ]
+    start_t = min(float(t) + lower for t in sequence["prompt_time"])
+    end_t = max(float(t) + upper for t in sequence["prompt_time"])
+    max_pre = max(bank.pre(str(n)) for n in sequence["name"])
+    max_len = max(bank.length(str(n)) for n in sequence["name"])
+    start_idx = max(0, int(np.searchsorted(times, start_t)) - max_pre)
+    stop_idx = min(len(features), int(np.searchsorted(times, end_t)) + max_len)
+    observed = features[start_idx:stop_idx]
+    sep = int(round(min_event_separation_s * bank.sample_rate))
+    prompt_times = sequence["prompt_time"].to_numpy(dtype=float)
+    names = [str(n) for n in sequence["name"]]
+    beams = [(float(np.sum(observed**2)), observed.copy(), [], 0.0)]
+    for pos, cands in enumerate(cand_list):
+        nxt = []
+        name = names[pos]
+        tmpl = bank.templates[name]
+        pre_n = bank.pre(name)
+        for _, residual, chosen, prior in beams:
+            for c in cands:
+                c = int(c)
+                if enforce_monotonic and chosen and c < chosen[-1] + sep:
+                    continue
+                nr = residual.copy()
+                _subtract_template_adaptive(nr, start_idx, c, tmpl, pre_n)
+                offset = float(times[c] - prompt_times[pos])
+                np_ = prior + prompt_prior_weight * offset**2
+                nxt.append((float(np.sum(nr**2)) + np_, nr, chosen + [c], np_))
+        if not nxt:
+            raise ValueError("adaptive beam search found no valid candidates")
+        nxt.sort(key=lambda x: x[0])
+        beams = nxt[:beam_width]
+    best = beams[0][2]
+    aligned = sequence.copy()
+    aligned["aligned_time"] = [float(times[i]) for i in best]
+    return aligned
+
+
+def align_prompt_times_adaptive(
+    features, times, prompts, window_samples, uncertainty_window,
+    max_iterations=30, beam_width=30, candidate_step_s=0.02, tolerance_s=0.005,
+    template_estimator="rerp", template_ridge=1e-3, enforce_monotonic=True,
+    min_event_separation_s=0.0, prompt_prior_weight=0.0, progress=False,
+):
+    """EM alignment with a PER-GESTURE template window (window_samples: name->(pre_n,post_n))."""
+    aligned = _valid_sorted_prompts(prompts).copy()
+    aligned["prompt_time"] = aligned["time"].to_numpy(dtype=float)
+    aligned["aligned_time"] = aligned["prompt_time"]
+    sample_rate = infer_sample_rate(times)
+    bank = None
+    for it in range(max_iterations):
+        bank = _estimate_adaptive_templates(
+            features, times, aligned, window_samples, sample_rate,
+            "aligned_time", template_estimator, template_ridge)
+        prev = aligned["aligned_time"].to_numpy(dtype=float).copy()
+        pieces = []
+        for seq in group_overlapping_sequences(aligned, uncertainty_window):
+            pieces.append(_align_sequence_adaptive(
+                features, times, seq, bank, uncertainty_window, beam_width,
+                candidate_step_s, enforce_monotonic, min_event_separation_s, prompt_prior_weight))
+        aligned = pd.concat(pieces, axis=0).sort_index()
+        update = float(np.max(np.abs(aligned["aligned_time"].to_numpy(dtype=float) - prev)))
+        if progress:
+            print(f"[adaptive] iter {it+1}/{max_iterations}: max update = {update:.4f}s", flush=True)
+        if update < tolerance_s:
+            if progress:
+                print(f"[adaptive] converged after {it+1} iterations", flush=True)
+            break
+    aligned["alignment_offset"] = aligned["aligned_time"] - aligned["prompt_time"]
+    return aligned, bank
+
+
 def recenter_template_bank(templates: TemplateBank) -> TemplateBank:
     """Shift each template so its energy peak is centered on event time zero.
 

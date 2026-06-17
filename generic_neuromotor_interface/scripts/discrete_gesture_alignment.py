@@ -18,6 +18,7 @@ import pandas as pd
 from generic_neuromotor_interface.discrete_gesture_alignment import (
     _candidate_indices,
     align_prompt_times,
+    align_prompt_times_adaptive,
     emg_envelope_features,
     estimate_templates,
     format_sequence_stats,
@@ -625,6 +626,14 @@ def global_recenter(
     "--uncertainty target, to stop the cold-start template from scattering "
     "events. 0 disables (single-stage).",
 )
+@click.option(
+    "--adaptive-windows-csv",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="CSV with per-gesture best windows (columns: name, pre, post; or a "
+    "window-sweep output with name,pre,post,median_after -> best per gesture is "
+    "picked). Enables per-gesture adaptive pre/post; overrides --pre/--post.",
+)
 def simulate_shift_eval(
     hdf5_path: Path,
     output_dir: Path,
@@ -660,6 +669,7 @@ def simulate_shift_eval(
     with_oracle: bool,
     oracle_init: bool,
     coarse_to_fine: int,
+    adaptive_windows_csv: Path | None,
 ) -> None:
     """Randomly perturb event labels, align them, and evaluate against original labels.
 
@@ -798,26 +808,58 @@ def simulate_shift_eval(
             aligned_time_col="time", method=template_estimator, ridge=template_ridge,
         )
 
-    aligned, _ = align_prompt_times(
-        features=features,
-        times=feature_times,
-        prompts=shifted_prompts[["name", "time", "original_prompt_index"]],
-        pre_s=pre,
-        post_s=post,
-        uncertainty_window=uncertainty,
-        max_iterations=iterations,
-        beam_width=beam_width,
-        candidate_step_s=candidate_step,
-        recenter_templates=recenter,
-        template_estimator=template_estimator,
-        template_ridge=template_ridge,
-        enforce_monotonic=True,
-        min_event_separation_s=min_event_separation,
-        prompt_prior_weight=prompt_prior_weight,
-        progress=True,
-        init_templates=init_bank,
-        uncertainty_schedule=uncertainty_schedule,
-    )
+    if adaptive_windows_csv is not None:
+        wdf = pd.read_csv(adaptive_windows_csv)
+        if "median_after" in wdf.columns:
+            wdf = wdf.loc[wdf.groupby("name")["median_after"].idxmin()]
+        sr = infer_sample_rate(feature_times)
+        window_samples = {
+            str(r.name): (int(round(float(r.pre) * sr)), int(round(float(r.post) * sr)))
+            for r in wdf.itertuples()
+        }
+        click.echo(
+            f"Adaptive per-gesture windows ({len(window_samples)} gestures): "
+            + ", ".join(f"{n}:{p}/{q}s" for n, (p, q) in
+                        {k: (round(v[0]/sr, 2), round(v[1]/sr, 2)) for k, v in window_samples.items()}.items()),
+            err=True,
+        )
+        aligned, _ = align_prompt_times_adaptive(
+            features=features,
+            times=feature_times,
+            prompts=shifted_prompts[["name", "time", "original_prompt_index"]],
+            window_samples=window_samples,
+            uncertainty_window=uncertainty,
+            max_iterations=iterations,
+            beam_width=beam_width,
+            candidate_step_s=candidate_step,
+            template_estimator=template_estimator,
+            template_ridge=template_ridge,
+            enforce_monotonic=True,
+            min_event_separation_s=min_event_separation,
+            prompt_prior_weight=prompt_prior_weight,
+            progress=True,
+        )
+    else:
+        aligned, _ = align_prompt_times(
+            features=features,
+            times=feature_times,
+            prompts=shifted_prompts[["name", "time", "original_prompt_index"]],
+            pre_s=pre,
+            post_s=post,
+            uncertainty_window=uncertainty,
+            max_iterations=iterations,
+            beam_width=beam_width,
+            candidate_step_s=candidate_step,
+            recenter_templates=recenter,
+            template_estimator=template_estimator,
+            template_ridge=template_ridge,
+            enforce_monotonic=True,
+            min_event_separation_s=min_event_separation,
+            prompt_prior_weight=prompt_prior_weight,
+            progress=True,
+            init_templates=init_bank,
+            uncertainty_schedule=uncertainty_schedule,
+        )
     click.echo("Alignment finished. Computing errors against ground truth.", err=True)
 
     shifted_by_index = shifted_prompts.sort_index()
