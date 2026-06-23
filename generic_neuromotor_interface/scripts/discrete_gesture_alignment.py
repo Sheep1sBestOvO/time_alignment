@@ -19,6 +19,7 @@ from generic_neuromotor_interface.discrete_gesture_alignment import (
     _candidate_indices,
     align_prompt_times,
     align_prompt_times_adaptive,
+    auto_window_samples,
     emg_envelope_features,
     estimate_templates,
     format_sequence_stats,
@@ -634,6 +635,16 @@ def global_recenter(
     "window-sweep output with name,pre,post,median_after -> best per gesture is "
     "picked). Enables per-gesture adaptive pre/post; overrides --pre/--post.",
 )
+@click.option(
+    "--auto-windows/--no-auto-windows",
+    default=False,
+    show_default=True,
+    help="Derive per-gesture windows automatically from THIS user's template "
+    "energy support (no sweep, no ground truth). Overrides --adaptive-windows-csv.",
+)
+@click.option("--auto-pre-max", type=float, default=0.5, show_default=True)
+@click.option("--auto-post-max", type=float, default=1.0, show_default=True)
+@click.option("--auto-energy-thresh", type=float, default=0.15, show_default=True)
 def simulate_shift_eval(
     hdf5_path: Path,
     output_dir: Path,
@@ -670,6 +681,10 @@ def simulate_shift_eval(
     oracle_init: bool,
     coarse_to_fine: int,
     adaptive_windows_csv: Path | None,
+    auto_windows: bool,
+    auto_pre_max: float,
+    auto_post_max: float,
+    auto_energy_thresh: float,
 ) -> None:
     """Randomly perturb event labels, align them, and evaluate against original labels.
 
@@ -808,11 +823,28 @@ def simulate_shift_eval(
             aligned_time_col="time", method=template_estimator, ridge=template_ridge,
         )
 
-    if adaptive_windows_csv is not None:
+    window_samples = None
+    sr = infer_sample_rate(feature_times)
+    if auto_windows:
+        window_samples = auto_window_samples(
+            features, feature_times, shifted_prompts, sr,
+            pre_max_s=auto_pre_max, post_max_s=auto_post_max,
+            energy_threshold=auto_energy_thresh, time_col="time",
+        )
+        wins_df = pd.DataFrame(
+            [{"name": n, "pre": round(p / sr, 3), "post": round(q / sr, 3)}
+             for n, (p, q) in window_samples.items()]
+        )
+        wins_df.to_csv(output_dir / f"{hdf5_path.stem}_auto_windows.csv", index=False)
+        click.echo(
+            "Auto per-gesture windows (from this user's template energy): "
+            + ", ".join(f"{n}:{p/sr:.2f}/{q/sr:.2f}s" for n, (p, q) in window_samples.items()),
+            err=True,
+        )
+    elif adaptive_windows_csv is not None:
         wdf = pd.read_csv(adaptive_windows_csv)
         if "median_after" in wdf.columns:
             wdf = wdf.loc[wdf.groupby("name")["median_after"].idxmin()]
-        sr = infer_sample_rate(feature_times)
         window_samples = {
             str(r.name): (int(round(float(r.pre) * sr)), int(round(float(r.post) * sr)))
             for r in wdf.itertuples()
@@ -823,6 +855,8 @@ def simulate_shift_eval(
                         {k: (round(v[0]/sr, 2), round(v[1]/sr, 2)) for k, v in window_samples.items()}.items()),
             err=True,
         )
+
+    if window_samples is not None:
         aligned, _ = align_prompt_times_adaptive(
             features=features,
             times=feature_times,

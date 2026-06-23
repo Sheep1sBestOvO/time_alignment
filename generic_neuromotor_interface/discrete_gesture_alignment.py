@@ -834,6 +834,50 @@ def _estimate_adaptive_templates(
     return AdaptiveTemplateBank(templates, window_samples, sample_rate)
 
 
+def auto_window_samples(
+    features: np.ndarray,
+    times: np.ndarray,
+    prompts: pd.DataFrame,
+    sample_rate: float,
+    pre_max_s: float = 0.5,
+    post_max_s: float = 1.0,
+    energy_threshold: float = 0.15,
+    time_col: str = "time",
+    min_pre_s: float = 0.05,
+    min_post_s: float = 0.10,
+) -> dict[str, tuple[int, int]]:
+    """Derive a per-gesture (pre, post) window from each gesture's template energy
+    support — no ground truth, no sweep. Estimates a long-window average template
+    per gesture (at the given event times), finds the contiguous region around the
+    energy peak that exceeds ``energy_threshold`` x peak, and crops the window to it.
+    """
+
+    pre_max = int(round(pre_max_s * sample_rate))
+    post_max = int(round(post_max_s * sample_rate))
+    bank = estimate_templates_average(
+        features, times, _valid_sorted_prompts(prompts), pre_max, post_max,
+        sample_rate, aligned_time_col=time_col,
+    )
+    min_pre = max(1, int(round(min_pre_s * sample_rate)))
+    min_post = max(1, int(round(min_post_s * sample_rate)))
+    out: dict[str, tuple[int, int]] = {}
+    for name, tmpl in bank.templates.items():
+        energy = np.sum(np.asarray(tmpl, dtype=np.float64) ** 2, axis=1)
+        peak = int(np.argmax(energy))
+        thr = energy[peak] * energy_threshold
+        lo = peak
+        while lo > 0 and energy[lo - 1] >= thr:
+            lo -= 1
+        hi = peak
+        while hi < len(energy) - 1 and energy[hi + 1] >= thr:
+            hi += 1
+        # event reference sits at index pre_max within the template
+        pre_n = max(min_pre, pre_max - lo)
+        post_n = max(min_post, hi - pre_max + 1)
+        out[str(name)] = (int(pre_n), int(post_n))
+    return out
+
+
 def _subtract_template_adaptive(residual, residual_start_idx, center_idx, template, pre_n):
     start = center_idx - pre_n
     stop = start + len(template)
