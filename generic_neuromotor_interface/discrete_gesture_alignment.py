@@ -846,26 +846,40 @@ def _subtract_template_adaptive(residual, residual_start_idx, center_idx, templa
     residual[rs: rs + (b - a)] -= template[ts: ts + (b - a)]
 
 
-def _align_single_event_adaptive(features, times, sequence, bank, uncertainty_window, candidate_step_s):
+def _align_single_event_adaptive(features, times, sequence, bank, uncertainty_window,
+                                 candidate_step_s, prompt_prior_weight=0.0):
     row = sequence.iloc[0]
     name = str(row["name"])
     template = bank.templates[name]
     pre_n = bank.pre(name)
     L = bank.length(name)
+    prompt_t = float(row["prompt_time"])
     candidates = _candidate_indices(
-        times, float(row["prompt_time"]), uncertainty_window[0], uncertainty_window[1],
+        times, prompt_t, uncertainty_window[0], uncertainty_window[1],
         candidate_step_s, bank.sample_rate,
     )
-    best_cost, best_idx = np.inf, int(np.searchsorted(times, float(row["prompt_time"])))
+    halfwidth = max(abs(uncertainty_window[0]), abs(uncertainty_window[1]), 1e-9)
+    cand, ssr, off = [], [], []
     for c in candidates:
         c = int(c); s = c - pre_n; e = s + L
         if s < 0 or e > len(features):
             continue
-        cost = float(np.sum((features[s:e] - template) ** 2))
-        if cost < best_cost:
-            best_cost, best_idx = cost, c
+        cand.append(c)
+        ssr.append(float(np.sum((features[s:e] - template) ** 2)))
+        off.append((float(times[c]) - prompt_t) / halfwidth)
+    if not cand:
+        aligned = sequence.copy()
+        aligned["aligned_time"] = float(times[int(np.searchsorted(times, prompt_t))])
+        return aligned
+    ssr = np.asarray(ssr)
+    off = np.asarray(off)
+    rng = float(ssr.max() - ssr.min())
+    # normalize match cost to [0,1] so prompt_prior_weight is a meaningful mix weight
+    ssr_norm = (ssr - ssr.min()) / rng if rng > 1e-12 else np.zeros_like(ssr)
+    total = ssr_norm + prompt_prior_weight * off**2
+    best = int(np.argmin(total))
     aligned = sequence.copy()
-    aligned["aligned_time"] = float(times[best_idx])
+    aligned["aligned_time"] = float(times[cand[best]])
     return aligned
 
 
@@ -874,8 +888,10 @@ def _align_sequence_adaptive(features, times, sequence, bank, uncertainty_window
                              min_event_separation_s, prompt_prior_weight):
     if len(sequence) == 1:
         return _align_single_event_adaptive(
-            features, times, sequence, bank, uncertainty_window, candidate_step_s)
+            features, times, sequence, bank, uncertainty_window, candidate_step_s,
+            prompt_prior_weight)
     lower, upper = uncertainty_window
+    halfwidth = max(abs(lower), abs(upper), 1e-9)
     cand_list = [
         _candidate_indices(times, float(r.prompt_time), lower, upper, candidate_step_s, bank.sample_rate)
         for r in sequence.itertuples()
@@ -887,10 +903,11 @@ def _align_sequence_adaptive(features, times, sequence, bank, uncertainty_window
     start_idx = max(0, int(np.searchsorted(times, start_t)) - max_pre)
     stop_idx = min(len(features), int(np.searchsorted(times, end_t)) + max_len)
     observed = features[start_idx:stop_idx]
+    observed_energy = max(float(np.sum(observed**2)), 1e-12)  # normalize residual to ~[0,1]
     sep = int(round(min_event_separation_s * bank.sample_rate))
     prompt_times = sequence["prompt_time"].to_numpy(dtype=float)
     names = [str(n) for n in sequence["name"]]
-    beams = [(float(np.sum(observed**2)), observed.copy(), [], 0.0)]
+    beams = [(0.0, observed.copy(), [], 0.0)]
     for pos, cands in enumerate(cand_list):
         nxt = []
         name = names[pos]
@@ -903,9 +920,10 @@ def _align_sequence_adaptive(features, times, sequence, bank, uncertainty_window
                     continue
                 nr = residual.copy()
                 _subtract_template_adaptive(nr, start_idx, c, tmpl, pre_n)
-                offset = float(times[c] - prompt_times[pos])
+                offset = float(times[c] - prompt_times[pos]) / halfwidth
                 np_ = prior + prompt_prior_weight * offset**2
-                nxt.append((float(np.sum(nr**2)) + np_, nr, chosen + [c], np_))
+                resid_term = float(np.sum(nr**2)) / observed_energy
+                nxt.append((resid_term + np_, nr, chosen + [c], np_))
         if not nxt:
             raise ValueError("adaptive beam search found no valid candidates")
         nxt.sort(key=lambda x: x[0])
