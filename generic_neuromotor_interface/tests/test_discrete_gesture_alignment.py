@@ -14,6 +14,7 @@ from generic_neuromotor_interface.discrete_gesture_alignment import (
     group_overlapping_sequences,
     multivariate_power_frequency_features,
     recenter_template_bank_to_reference,
+    summarize_template_bank_alignment,
     summarize_prompt_pattern,
 )
 
@@ -171,6 +172,40 @@ def test_beam_search_enforces_monotonic_event_order():
     assert np.all(np.diff(aligned["aligned_time"]) >= 0)
 
 
+def test_beam_search_prompt_prior_can_be_centered_after_prompt():
+    sample_rate = 10
+    times = np.arange(0, 4, 1 / sample_rate)
+    features = np.zeros((len(times), 1))
+    sequence = pd.DataFrame(
+        {
+            "name": ["tap", "tap"],
+            "time": [1.0, 2.0],
+            "prompt_time": [1.0, 2.0],
+        }
+    )
+    templates = TemplateBank(
+        templates={"tap": np.zeros((1, 1))},
+        pre_samples=0,
+        post_samples=1,
+        sample_rate=sample_rate,
+    )
+
+    aligned = _align_sequence(
+        features=features,
+        times=times,
+        sequence=sequence,
+        templates=templates,
+        uncertainty_window=(0.0, 0.2),
+        beam_width=5,
+        candidate_step_s=0.1,
+        enforce_monotonic=True,
+        prompt_prior_weight=1.0,
+        prompt_prior_center_s=0.1,
+    )
+
+    np.testing.assert_allclose(aligned["aligned_time"], [1.1, 2.1], atol=1e-9)
+
+
 def test_multivariate_power_frequency_features_shape_and_times():
     sample_rate = 2000
     times = np.arange(1000) / sample_rate
@@ -231,6 +266,30 @@ def test_reference_recenter_finds_template_shift():
 
     assert shifts["tap"] == 2
     np.testing.assert_allclose(recentered.templates["tap"], reference_waveform)
+
+
+def test_summarize_template_bank_alignment_reports_shift_and_correlation():
+    reference_waveform = np.array([0, 0, 0, 1, 4, 1, 0, 0, 0], dtype=float)[:, None]
+    session_waveform = np.array([0, 1, 4, 1, 0, 0, 0, 0, 0], dtype=float)[:, None]
+    session = TemplateBank(
+        templates={"tap": session_waveform},
+        pre_samples=4,
+        post_samples=5,
+        sample_rate=100,
+    )
+    reference = TemplateBank(
+        templates={"tap": reference_waveform},
+        pre_samples=4,
+        post_samples=5,
+        sample_rate=100,
+    )
+
+    summary = summarize_template_bank_alignment(session, reference)
+
+    assert summary.loc[0, "name"] == "tap"
+    assert summary.loc[0, "shift_samples"] == 2
+    assert summary.loc[0, "shift_seconds"] == 0.02
+    assert summary.loc[0, "correlation"] > 0.99
 
 
 def test_recenter_shift_updates_aligned_times_with_opposite_sign():

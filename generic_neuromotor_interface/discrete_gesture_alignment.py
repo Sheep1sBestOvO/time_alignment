@@ -604,6 +604,7 @@ def align_prompt_times(
     enforce_monotonic: bool = True,
     min_event_separation_s: float = 0.0,
     prompt_prior_weight: float = 0.0,
+    prompt_prior_center_s: float = 0.0,
     progress: bool = False,
     init_templates: "TemplateBank | None" = None,
     uncertainty_schedule: "Sequence[tuple[float, float]] | None" = None,
@@ -703,6 +704,7 @@ def align_prompt_times(
                         enforce_monotonic=enforce_monotonic,
                         min_event_separation_s=min_event_separation_s,
                         prompt_prior_weight=prompt_prior_weight,
+                        prompt_prior_center_s=prompt_prior_center_s,
                     )
                 )
                 if progress and (seq_idx % 200 == 0 or seq_idx == len(sequences)):
@@ -891,7 +893,8 @@ def _subtract_template_adaptive(residual, residual_start_idx, center_idx, templa
 
 
 def _align_single_event_adaptive(features, times, sequence, bank, uncertainty_window,
-                                 candidate_step_s, prompt_prior_weight=0.0):
+                                 candidate_step_s, prompt_prior_weight=0.0,
+                                 prompt_prior_center_s=0.0):
     row = sequence.iloc[0]
     name = str(row["name"])
     template = bank.templates[name]
@@ -910,7 +913,7 @@ def _align_single_event_adaptive(features, times, sequence, bank, uncertainty_wi
             continue
         cand.append(c)
         ssr.append(float(np.sum((features[s:e] - template) ** 2)))
-        off.append((float(times[c]) - prompt_t) / halfwidth)
+        off.append((float(times[c]) - (prompt_t + prompt_prior_center_s)) / halfwidth)
     if not cand:
         aligned = sequence.copy()
         aligned["aligned_time"] = float(times[int(np.searchsorted(times, prompt_t))])
@@ -929,11 +932,12 @@ def _align_single_event_adaptive(features, times, sequence, bank, uncertainty_wi
 
 def _align_sequence_adaptive(features, times, sequence, bank, uncertainty_window,
                              beam_width, candidate_step_s, enforce_monotonic,
-                             min_event_separation_s, prompt_prior_weight):
+                             min_event_separation_s, prompt_prior_weight,
+                             prompt_prior_center_s):
     if len(sequence) == 1:
         return _align_single_event_adaptive(
             features, times, sequence, bank, uncertainty_window, candidate_step_s,
-            prompt_prior_weight)
+            prompt_prior_weight, prompt_prior_center_s)
     lower, upper = uncertainty_window
     halfwidth = max(abs(lower), abs(upper), 1e-9)
     cand_list = [
@@ -964,7 +968,9 @@ def _align_sequence_adaptive(features, times, sequence, bank, uncertainty_window
                     continue
                 nr = residual.copy()
                 _subtract_template_adaptive(nr, start_idx, c, tmpl, pre_n)
-                offset = float(times[c] - prompt_times[pos]) / halfwidth
+                offset = float(
+                    times[c] - (prompt_times[pos] + prompt_prior_center_s)
+                ) / halfwidth
                 np_ = prior + prompt_prior_weight * offset**2
                 resid_term = float(np.sum(nr**2)) / observed_energy
                 nxt.append((resid_term + np_, nr, chosen + [c], np_))
@@ -982,7 +988,8 @@ def align_prompt_times_adaptive(
     features, times, prompts, window_samples, uncertainty_window,
     max_iterations=30, beam_width=30, candidate_step_s=0.02, tolerance_s=0.005,
     template_estimator="rerp", template_ridge=1e-3, enforce_monotonic=True,
-    min_event_separation_s=0.0, prompt_prior_weight=0.0, progress=False,
+    min_event_separation_s=0.0, prompt_prior_weight=0.0,
+    prompt_prior_center_s=0.0, progress=False,
 ):
     """EM alignment with a PER-GESTURE template window (window_samples: name->(pre_n,post_n))."""
     aligned = _valid_sorted_prompts(prompts).copy()
@@ -999,7 +1006,8 @@ def align_prompt_times_adaptive(
         for seq in group_overlapping_sequences(aligned, uncertainty_window):
             pieces.append(_align_sequence_adaptive(
                 features, times, seq, bank, uncertainty_window, beam_width,
-                candidate_step_s, enforce_monotonic, min_event_separation_s, prompt_prior_weight))
+                candidate_step_s, enforce_monotonic, min_event_separation_s,
+                prompt_prior_weight, prompt_prior_center_s))
         aligned = pd.concat(pieces, axis=0).sort_index()
         update = float(np.max(np.abs(aligned["aligned_time"].to_numpy(dtype=float) - prev)))
         if progress:
@@ -1100,6 +1108,43 @@ def estimate_template_recenter_shifts(
             max_shift_samples=max_shift_samples,
         )
     return shifts
+
+
+def summarize_template_bank_alignment(
+    session_templates: TemplateBank,
+    reference_templates: TemplateBank,
+    max_shift_s: float | None = None,
+) -> pd.DataFrame:
+    """Summarize per-gesture template drift relative to a reference bank.
+
+    Positive ``shift_samples`` means the session template must move later in
+    template coordinates to best match the reference. Event timestamps would be
+    adjusted by the opposite sign if that shift were applied as recentering.
+    """
+
+    shifts = estimate_template_recenter_shifts(
+        session_templates,
+        reference_templates,
+        max_shift_s=max_shift_s,
+    )
+    rows = []
+    for name in sorted(shifts):
+        shift = shifts[name]
+        shifted = _shift_with_zeros(session_templates.templates[name], shift)
+        rows.append(
+            {
+                "name": name,
+                "shift_samples": int(shift),
+                "shift_seconds": float(shift / session_templates.sample_rate),
+                "correlation": float(
+                    _normalized_template_correlation(
+                        shifted,
+                        reference_templates.templates[name],
+                    )
+                ),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def recenter_template_bank_to_reference(
@@ -1245,10 +1290,18 @@ def _align_sequence(
     enforce_monotonic: bool = True,
     min_event_separation_s: float = 0.0,
     prompt_prior_weight: float = 0.0,
+    prompt_prior_center_s: float = 0.0,
 ) -> pd.DataFrame:
     if len(sequence) == 1:
         return _align_single_event(
-            features, times, sequence, templates, uncertainty_window, candidate_step_s
+            features,
+            times,
+            sequence,
+            templates,
+            uncertainty_window,
+            candidate_step_s,
+            prompt_prior_weight=prompt_prior_weight,
+            prompt_prior_center_s=prompt_prior_center_s,
         )
     if min_event_separation_s < 0:
         raise ValueError("min_event_separation_s must be non-negative")
@@ -1304,7 +1357,10 @@ def _align_sequence(
                         templates.templates[name],
                         templates,
                     )
-                    offset = float(times[candidate] - prompt_times[event_pos])
+                    offset = float(
+                        times[candidate]
+                        - (prompt_times[event_pos] + prompt_prior_center_s)
+                    )
                     next_prior_cost = prior_cost + prompt_prior_weight * offset**2
                     cost = float(np.sum(next_residual**2)) + next_prior_cost
                     produced.append(
@@ -1339,6 +1395,8 @@ def _align_single_event(
     templates: TemplateBank,
     uncertainty_window: tuple[float, float],
     candidate_step_s: float,
+    prompt_prior_weight: float = 0.0,
+    prompt_prior_center_s: float = 0.0,
 ) -> pd.DataFrame:
     row = sequence.iloc[0]
     template = templates.templates[str(row["name"])]
@@ -1357,7 +1415,13 @@ def _align_single_event(
         stop = start + templates.length
         if start < 0 or stop > len(features):
             continue
-        cost = float(np.sum((features[start:stop] - template) ** 2))
+        offset = float(
+            times[int(candidate)] - (float(row["prompt_time"]) + prompt_prior_center_s)
+        )
+        cost = (
+            float(np.sum((features[start:stop] - template) ** 2))
+            + prompt_prior_weight * offset**2
+        )
         if cost < best_cost:
             best_cost = cost
             best_idx = int(candidate)

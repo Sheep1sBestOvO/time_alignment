@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 
 from generic_neuromotor_interface.discrete_gesture_alignment import (
+    _align_sequence,
     _best_correlation_shift,
     _candidate_indices,
     align_prompt_times,
@@ -32,6 +33,7 @@ from generic_neuromotor_interface.discrete_gesture_alignment import (
     multivariate_power_frequency_features,
     save_aligned_prompts,
     summarize_prompt_pattern,
+    summarize_template_bank_alignment,
 )
 
 
@@ -237,6 +239,13 @@ def plot(
     show_default=True,
     help="Quadratic penalty weight for moving aligned times away from prompt times.",
 )
+@click.option(
+    "--prompt-prior-center",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="Center of the prompt prior relative to prompt time, in seconds.",
+)
 @click.option("--smoothing-ms", type=float, default=50.0, show_default=True)
 @click.option(
     "--template-estimator",
@@ -288,6 +297,7 @@ def align(
     monotonic: bool,
     min_event_separation: float,
     prompt_prior_weight: float,
+    prompt_prior_center: float,
     smoothing_ms: float,
     template_estimator: str,
     template_ridge: float,
@@ -336,6 +346,7 @@ def align(
         enforce_monotonic=monotonic,
         min_event_separation_s=min_event_separation,
         prompt_prior_weight=prompt_prior_weight,
+        prompt_prior_center_s=prompt_prior_center,
     )
     save_aligned_prompts(aligned, output_csv)
     click.echo(f"Saved {len(aligned)} aligned prompts to {output_csv}")
@@ -569,6 +580,13 @@ def global_recenter(
 @click.option("--candidate-step", type=float, default=0.02, show_default=True)
 @click.option("--min-event-separation", type=float, default=0.0, show_default=True)
 @click.option("--prompt-prior-weight", type=float, default=0.0, show_default=True)
+@click.option(
+    "--prompt-prior-center",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="Center of the prompt prior relative to prompt time, in seconds.",
+)
 @click.option("--smoothing-ms", type=float, default=50.0, show_default=True)
 @click.option(
     "--template-estimator",
@@ -665,6 +683,7 @@ def simulate_shift_eval(
     candidate_step: float,
     min_event_separation: float,
     prompt_prior_weight: float,
+    prompt_prior_center: float,
     smoothing_ms: float,
     template_estimator: str,
     template_ridge: float,
@@ -872,6 +891,7 @@ def simulate_shift_eval(
             enforce_monotonic=True,
             min_event_separation_s=min_event_separation,
             prompt_prior_weight=prompt_prior_weight,
+            prompt_prior_center_s=prompt_prior_center,
             progress=True,
         )
     else:
@@ -891,6 +911,7 @@ def simulate_shift_eval(
             enforce_monotonic=True,
             min_event_separation_s=min_event_separation,
             prompt_prior_weight=prompt_prior_weight,
+            prompt_prior_center_s=prompt_prior_center,
             progress=True,
             init_templates=init_bank,
             uncertainty_schedule=uncertainty_schedule,
@@ -1426,6 +1447,267 @@ def _compute_features_for_session(
     return features, feature_times
 
 
+@main.command("template-drift-diagnostic")
+@click.argument("hdf5_path", type=click.Path(exists=True, path_type=Path))
+@click.argument("output_dir", type=click.Path(path_type=Path))
+@click.option("--prompt-start", type=int, default=0, show_default=True)
+@click.option("--num-prompts", type=int, default=2000, show_default=True)
+@click.option(
+    "--shift-model",
+    type=click.Choice(["prompt-delay", "uniform"]),
+    default="prompt-delay",
+    show_default=True,
+)
+@click.option(
+    "--shift-range",
+    nargs=2,
+    type=float,
+    default=(-0.25, 0.25),
+    show_default=True,
+)
+@click.option("--delay-mean", type=float, default=0.25, show_default=True)
+@click.option("--delay-std", type=float, default=0.07, show_default=True)
+@click.option(
+    "--delay-range",
+    nargs=2,
+    type=float,
+    default=(0.05, 0.55),
+    show_default=True,
+)
+@click.option("--seed", type=int, default=0, show_default=True)
+@click.option("--pre", type=float, default=0.3, show_default=True)
+@click.option("--post", type=float, default=0.9, show_default=True)
+@click.option(
+    "--uncertainty",
+    nargs=2,
+    type=float,
+    default=(-0.10, 0.70),
+    show_default=True,
+)
+@click.option("--iterations", type=int, default=5, show_default=True)
+@click.option("--beam-width", type=int, default=30, show_default=True)
+@click.option("--candidate-step", type=float, default=0.02, show_default=True)
+@click.option("--min-event-separation", type=float, default=0.02, show_default=True)
+@click.option("--prompt-prior-weight", type=float, default=0.0, show_default=True)
+@click.option(
+    "--prompt-prior-center",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="Center of the prompt prior relative to prompt time, in seconds.",
+)
+@click.option(
+    "--template-estimator",
+    type=click.Choice(["rerp", "average"]),
+    default="rerp",
+    show_default=True,
+)
+@click.option("--template-ridge", type=float, default=1e-3, show_default=True)
+@click.option(
+    "--reference-template-estimator",
+    type=click.Choice(["rerp", "average"]),
+    default="rerp",
+    show_default=True,
+    help="Oracle template estimator used as the drift reference.",
+)
+@click.option("--max-template-shift", type=float, default=0.5, show_default=True)
+@click.option("--oracle-init/--no-oracle-init", default=True, show_default=True)
+@click.option(
+    "--feature",
+    type=click.Choice(["mpf", "envelope"]),
+    default="mpf",
+    show_default=True,
+)
+@click.option("--smoothing-ms", type=float, default=50.0, show_default=True)
+@click.option("--mpf-window-length", type=int, default=200, show_default=True)
+@click.option("--mpf-stride", type=int, default=40, show_default=True)
+@click.option("--mpf-n-fft", type=int, default=64, show_default=True)
+@click.option("--mpf-fft-stride", type=int, default=10, show_default=True)
+@click.option("--mpf-chunk-output-frames", type=int, default=4096, show_default=True)
+def template_drift_diagnostic(
+    hdf5_path: Path,
+    output_dir: Path,
+    prompt_start: int,
+    num_prompts: int,
+    shift_model: str,
+    shift_range: tuple[float, float],
+    delay_mean: float,
+    delay_std: float,
+    delay_range: tuple[float, float],
+    seed: int,
+    pre: float,
+    post: float,
+    uncertainty: tuple[float, float],
+    iterations: int,
+    beam_width: int,
+    candidate_step: float,
+    min_event_separation: float,
+    prompt_prior_weight: float,
+    prompt_prior_center: float,
+    template_estimator: str,
+    template_ridge: float,
+    reference_template_estimator: str,
+    max_template_shift: float,
+    oracle_init: bool,
+    feature: str,
+    smoothing_ms: float,
+    mpf_window_length: int,
+    mpf_stride: int,
+    mpf_n_fft: int,
+    mpf_fft_stride: int,
+    mpf_chunk_output_frames: int,
+) -> None:
+    """Trace template drift across EM iterations against oracle templates."""
+
+    if num_prompts <= 0:
+        raise click.BadParameter("num-prompts must be positive")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    click.echo(f"Loading HDF5: {hdf5_path}", err=True)
+    timeseries, prompts = load_discrete_gesture_hdf5(hdf5_path)
+    prompts = prompts.sort_values("time").reset_index(drop=True)
+    selected = prompts.iloc[prompt_start : prompt_start + num_prompts].copy()
+    if len(selected) == 0:
+        raise click.BadParameter("No prompts selected")
+
+    rng = np.random.default_rng(seed)
+    if shift_model == "prompt-delay":
+        if delay_std == 0:
+            delays = np.full(len(selected), delay_mean, dtype=float)
+        else:
+            delays = rng.normal(delay_mean, delay_std, size=len(selected))
+        delays = np.clip(delays, delay_range[0], delay_range[1])
+        shifts = -delays
+    else:
+        delays = np.full(len(selected), np.nan, dtype=float)
+        shifts = rng.uniform(shift_range[0], shift_range[1], size=len(selected))
+
+    shifted = selected.copy()
+    shifted["ground_truth_time"] = selected["time"].to_numpy(dtype=float)
+    shifted["time"] = shifted["ground_truth_time"].to_numpy(dtype=float) + shifts
+    shifted["simulated_reaction_delay_seconds"] = delays
+    shifted["random_shift_seconds"] = shifts
+    shifted["original_prompt_index"] = selected.index.to_numpy(dtype=int)
+
+    features, feature_times = _compute_features_for_session(
+        timeseries,
+        feature,
+        smoothing_ms,
+        mpf_window_length,
+        mpf_stride,
+        mpf_n_fft,
+        mpf_fft_stride,
+        mpf_chunk_output_frames,
+    )
+
+    truth = shifted.copy()
+    truth["time"] = truth["ground_truth_time"].to_numpy(dtype=float)
+    reference_bank = estimate_templates(
+        features,
+        feature_times,
+        truth,
+        pre,
+        post,
+        aligned_time_col="time",
+        method=reference_template_estimator,
+        ridge=template_ridge,
+    )
+
+    aligned = shifted[
+        ["name", "time", "ground_truth_time", "original_prompt_index"]
+    ].copy()
+    aligned["prompt_time"] = aligned["time"].to_numpy(dtype=float)
+    aligned["aligned_time"] = aligned["prompt_time"].to_numpy(dtype=float)
+
+    drift_rows = []
+    metric_rows = []
+    for iteration in range(1, iterations + 1):
+        if iteration == 1 and oracle_init:
+            template_bank = reference_bank
+            template_source = "oracle_reference"
+        else:
+            template_bank = estimate_templates(
+                features,
+                feature_times,
+                aligned,
+                pre,
+                post,
+                aligned_time_col="aligned_time",
+                method=template_estimator,
+                ridge=template_ridge,
+            )
+            template_source = "estimated_from_current_alignment"
+
+        drift = summarize_template_bank_alignment(
+            template_bank,
+            reference_bank,
+            max_shift_s=max_template_shift,
+        )
+        drift["iteration"] = iteration
+        drift["template_source"] = template_source
+        drift_rows.append(drift)
+
+        previous = aligned["aligned_time"].to_numpy(dtype=float).copy()
+        pieces = [
+            _align_sequence(
+                features=features,
+                times=feature_times,
+                sequence=sequence,
+                templates=template_bank,
+                uncertainty_window=uncertainty,
+                beam_width=beam_width,
+                candidate_step_s=candidate_step,
+                enforce_monotonic=True,
+                min_event_separation_s=min_event_separation,
+                prompt_prior_weight=prompt_prior_weight,
+                prompt_prior_center_s=prompt_prior_center,
+            )
+            for sequence in group_overlapping_sequences(aligned, uncertainty)
+        ]
+        aligned = pd.concat(pieces, axis=0).sort_index()
+        aligned["alignment_iteration"] = iteration
+        aligned["alignment_offset"] = aligned["aligned_time"] - aligned["prompt_time"]
+
+        error = (
+            aligned["aligned_time"].to_numpy(dtype=float)
+            - aligned["ground_truth_time"].to_numpy(dtype=float)
+        )
+        metric_rows.append(
+            {
+                "iteration": iteration,
+                "template_source": template_source,
+                "max_update": float(
+                    np.max(
+                        np.abs(
+                            aligned["aligned_time"].to_numpy(dtype=float) - previous
+                        )
+                    )
+                ),
+                "mae_after": float(np.mean(np.abs(error))),
+                "median_abs_error_after": float(np.median(np.abs(error))),
+                "median_signed_error_after": float(np.median(error)),
+                "demeaned_error_std_after": float(np.std(error - np.median(error))),
+            }
+        )
+        click.echo(
+            f"iter {iteration}: source={template_source}, "
+            f"median_abs_error={metric_rows[-1]['median_abs_error_after']:.4f}s, "
+            f"max_update={metric_rows[-1]['max_update']:.4f}s",
+            err=True,
+        )
+
+    stem = hdf5_path.stem
+    drift_csv = output_dir / f"{stem}_template_drift_by_iteration.csv"
+    metrics_csv = output_dir / f"{stem}_template_drift_metrics_by_iteration.csv"
+    aligned_csv = output_dir / f"{stem}_template_drift_final_aligned_prompts.csv"
+    pd.concat(drift_rows, axis=0, ignore_index=True).to_csv(drift_csv, index=False)
+    pd.DataFrame(metric_rows).to_csv(metrics_csv, index=False)
+    aligned.to_csv(aligned_csv, index=False)
+    click.echo(f"Saved template drift to {drift_csv}")
+    click.echo(f"Saved iteration metrics to {metrics_csv}")
+    click.echo(f"Saved final aligned prompts to {aligned_csv}")
+
+
 def _global_recenter_adaptive(aligned_tables, banks, max_shift_s):
     """Cross-session global recenter for per-gesture (adaptive) template banks.
 
@@ -1493,6 +1775,13 @@ def _global_recenter_adaptive(aligned_tables, banks, max_shift_s):
 @click.option("--prompt-prior-weight", type=float, default=1.0, show_default=True,
               help="Anchor weight against reverse/edge alignment (adaptive path).")
 @click.option(
+    "--prompt-prior-center",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="Center of the prompt prior relative to prompt time, in seconds.",
+)
+@click.option(
     "--template-estimator",
     type=click.Choice(["rerp", "average"]),
     default="rerp",
@@ -1548,6 +1837,7 @@ def multi_session_recenter_eval(
     candidate_step: float,
     min_event_separation: float,
     prompt_prior_weight: float,
+    prompt_prior_center: float,
     template_estimator: str,
     template_ridge: float,
     max_shift: float,
@@ -1644,7 +1934,9 @@ def multi_session_recenter_eval(
                 candidate_step_s=candidate_step, template_estimator=template_estimator,
                 template_ridge=template_ridge, enforce_monotonic=True,
                 min_event_separation_s=min_event_separation,
-                prompt_prior_weight=prompt_prior_weight, progress=True,
+                prompt_prior_weight=prompt_prior_weight,
+                prompt_prior_center_s=prompt_prior_center,
+                progress=True,
             )
         else:
             aligned, templates = align_prompt_times(
@@ -1654,6 +1946,8 @@ def multi_session_recenter_eval(
                 candidate_step_s=candidate_step, recenter_templates=False,
                 template_estimator=template_estimator, template_ridge=template_ridge,
                 enforce_monotonic=True, min_event_separation_s=min_event_separation,
+                prompt_prior_weight=prompt_prior_weight,
+                prompt_prior_center_s=prompt_prior_center,
                 progress=True, init_templates=init_bank,
             )
         aligned_tables[session_id] = aligned
@@ -1929,6 +2223,7 @@ def _load_or_compute_mpf(timeseries, fs, mpf_window_length, mpf_stride, mpf_n_ff
 @click.option("--candidate-step", type=float, default=0.02, show_default=True)
 @click.option("--min-event-separation", type=float, default=0.02, show_default=True)
 @click.option("--prompt-prior-weight", type=float, default=0.1, show_default=True)
+@click.option("--prompt-prior-center", type=float, default=0.0, show_default=True)
 @click.option("--template-estimator", type=click.Choice(["rerp", "average"]),
               default="rerp", show_default=True)
 @click.option("--template-ridge", type=float, default=1e-3, show_default=True)
@@ -1942,8 +2237,9 @@ def window_sweep(
     hdf5_path, output_csv, pre_min, pre_max, post_min, post_max, step,
     mpf_cache, build_cache_only, combo_start, combo_count,
     num_prompts, shift_range, uncertainty, iterations, beam_width, candidate_step,
-    min_event_separation, prompt_prior_weight, template_estimator, template_ridge, seed,
-    mpf_window_length, mpf_stride, mpf_n_fft, mpf_fft_stride, mpf_chunk_output_frames,
+    min_event_separation, prompt_prior_weight, prompt_prior_center,
+    template_estimator, template_ridge, seed, mpf_window_length, mpf_stride,
+    mpf_n_fft, mpf_fft_stride, mpf_chunk_output_frames,
 ) -> None:
     """Sweep (pre, post) template windows on a fixed MPF cache and record per-gesture
     alignment error for each window, to find the best window per gesture.
@@ -1996,7 +2292,9 @@ def window_sweep(
             candidate_step_s=candidate_step, recenter_templates=False,
             template_estimator=template_estimator, template_ridge=template_ridge,
             enforce_monotonic=True, min_event_separation_s=min_event_separation,
-            prompt_prior_weight=prompt_prior_weight, progress=False,
+            prompt_prior_weight=prompt_prior_weight,
+            prompt_prior_center_s=prompt_prior_center,
+            progress=False,
         )
         aligned = aligned.sort_index()
         gt_a = aligned["ground_truth_time"].to_numpy(dtype=float)
