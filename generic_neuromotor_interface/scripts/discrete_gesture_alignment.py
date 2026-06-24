@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 
 from generic_neuromotor_interface.discrete_gesture_alignment import (
+    _best_correlation_shift,
     _candidate_indices,
     align_prompt_times,
     align_prompt_times_adaptive,
@@ -1425,6 +1426,35 @@ def _compute_features_for_session(
     return features, feature_times
 
 
+def _global_recenter_adaptive(aligned_tables, banks, max_shift_s):
+    """Cross-session global recenter for per-gesture (adaptive) template banks.
+
+    Per gesture, builds the grand-average template across sessions (same length,
+    since the window map is shared), finds each session's max-correlation shift to
+    it, and shifts that session's events of that gesture accordingly."""
+    sample_rate = next(iter(banks.values())).sample_rate
+    all_g = set().union(*(set(b.templates) for b in banks.values()))
+    grand = {}
+    for g in all_g:
+        tmpls = [b.templates[g] for b in banks.values() if g in b.templates]
+        grand[g] = np.mean(np.stack(tmpls, axis=0), axis=0)
+    max_shift_n = int(round(max_shift_s * sample_rate)) if max_shift_s else None
+    recentered, rows = {}, []
+    for sid, b in banks.items():
+        shift_by_gesture = {}
+        for g, tmpl in b.templates.items():
+            ms = max_shift_n if max_shift_n is not None else len(tmpl) - 1
+            shift_by_gesture[g] = _best_correlation_shift(tmpl, grand[g], ms)
+        df = aligned_tables[sid].copy()
+        shifts = df["name"].astype(str).map(shift_by_gesture).fillna(0).to_numpy(float)
+        df["aligned_time"] = df["aligned_time"].to_numpy(float) - shifts / sample_rate
+        recentered[sid] = df
+        for g, s in shift_by_gesture.items():
+            rows.append({"session_id": sid, "name": g, "shift_samples": int(s),
+                         "shift_seconds": s / sample_rate})
+    return recentered, pd.DataFrame(rows)
+
+
 @main.command("multi-session-recenter-eval")
 @click.argument("hdf5_paths", nargs=-1, type=click.Path(exists=True, path_type=Path))
 @click.option("--output-dir", required=True, type=click.Path(path_type=Path))
@@ -1460,6 +1490,8 @@ def _compute_features_for_session(
 @click.option("--beam-width", type=int, default=30, show_default=True)
 @click.option("--candidate-step", type=float, default=0.02, show_default=True)
 @click.option("--min-event-separation", type=float, default=0.02, show_default=True)
+@click.option("--prompt-prior-weight", type=float, default=1.0, show_default=True,
+              help="Anchor weight against reverse/edge alignment (adaptive path).")
 @click.option(
     "--template-estimator",
     type=click.Choice(["rerp", "average"]),
@@ -1494,6 +1526,14 @@ def _compute_features_for_session(
     help="Seed each session's EM first iteration with oracle templates (from "
     "ground truth). Isolates the global-recenter step from cold-start EM failure.",
 )
+@click.option(
+    "--adaptive-windows-csv",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Per-gesture window CSV (name,pre,post). Each session aligns with these "
+    "per-gesture windows (no per-EM-step recenter); a single cross-session global "
+    "recenter is applied at the end (paper-style).",
+)
 def multi_session_recenter_eval(
     hdf5_paths: tuple[Path, ...],
     output_dir: Path,
@@ -1507,6 +1547,7 @@ def multi_session_recenter_eval(
     beam_width: int,
     candidate_step: float,
     min_event_separation: float,
+    prompt_prior_weight: float,
     template_estimator: str,
     template_ridge: float,
     max_shift: float,
@@ -1519,6 +1560,7 @@ def multi_session_recenter_eval(
     mpf_fft_stride: int,
     mpf_chunk_output_frames: int,
     oracle_init: bool,
+    adaptive_windows_csv: Path | None,
 ) -> None:
     """Validate the full pipeline: inject DIFFERENT systematic offsets per session,
     align each with EM, then run global recentering and check whether the
@@ -1546,6 +1588,13 @@ def multi_session_recenter_eval(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(seed)
+
+    win_df = None
+    if adaptive_windows_csv is not None:
+        win_df = pd.read_csv(adaptive_windows_csv)
+        if "median_after" in win_df.columns:
+            win_df = win_df.loc[win_df.groupby("name")["median_after"].idxmin()]
+        click.echo(f"Using per-gesture adaptive windows from {adaptive_windows_csv}", err=True)
 
     aligned_tables: dict[str, pd.DataFrame] = {}
     template_banks = {}
@@ -1581,31 +1630,44 @@ def multi_session_recenter_eval(
                 aligned_time_col="time", method=template_estimator, ridge=template_ridge,
             )
 
-        aligned, templates = align_prompt_times(
-            features=features,
-            times=feature_times,
-            prompts=shifted[["name", "time", "ground_truth_time", "original_prompt_index"]],
-            pre_s=pre,
-            post_s=post,
-            uncertainty_window=uncertainty,
-            max_iterations=iterations,
-            beam_width=beam_width,
-            candidate_step_s=candidate_step,
-            recenter_templates=False,
-            template_estimator=template_estimator,
-            template_ridge=template_ridge,
-            enforce_monotonic=True,
-            min_event_separation_s=min_event_separation,
-            progress=True,
-            init_templates=init_bank,
-        )
+        prompts_in = shifted[["name", "time", "ground_truth_time", "original_prompt_index"]]
+        if win_df is not None:
+            sr = infer_sample_rate(feature_times)
+            window_samples = {
+                str(r.name): (int(round(float(r.pre) * sr)), int(round(float(r.post) * sr)))
+                for r in win_df.itertuples()
+            }
+            aligned, templates = align_prompt_times_adaptive(
+                features=features, times=feature_times, prompts=prompts_in,
+                window_samples=window_samples, uncertainty_window=uncertainty,
+                max_iterations=iterations, beam_width=beam_width,
+                candidate_step_s=candidate_step, template_estimator=template_estimator,
+                template_ridge=template_ridge, enforce_monotonic=True,
+                min_event_separation_s=min_event_separation,
+                prompt_prior_weight=prompt_prior_weight, progress=True,
+            )
+        else:
+            aligned, templates = align_prompt_times(
+                features=features, times=feature_times, prompts=prompts_in,
+                pre_s=pre, post_s=post, uncertainty_window=uncertainty,
+                max_iterations=iterations, beam_width=beam_width,
+                candidate_step_s=candidate_step, recenter_templates=False,
+                template_estimator=template_estimator, template_ridge=template_ridge,
+                enforce_monotonic=True, min_event_separation_s=min_event_separation,
+                progress=True, init_templates=init_bank,
+            )
         aligned_tables[session_id] = aligned
         template_banks[session_id] = templates
 
     click.echo("\n=== Running global recentering across sessions ===", err=True)
-    _, recentered_tables, shift_summary = global_recenter_aligned_prompts(
-        aligned_tables, template_banks, max_shift_s=max_shift,
-    )
+    if win_df is not None:
+        recentered_tables, shift_summary = _global_recenter_adaptive(
+            aligned_tables, template_banks, max_shift_s=max_shift,
+        )
+    else:
+        _, recentered_tables, shift_summary = global_recenter_aligned_prompts(
+            aligned_tables, template_banks, max_shift_s=max_shift,
+        )
 
     # Evaluate each stage against ground truth.
     summary_rows = []
