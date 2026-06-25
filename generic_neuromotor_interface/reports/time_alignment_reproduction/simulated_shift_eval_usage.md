@@ -10,11 +10,13 @@
 ground_truth_time = public prompts.time
 ```
 
-然后随机偏移这些 label：
+然后模拟真实采集中的 prompt delay：
 
 ```text
-shifted_time = ground_truth_time + random_shift
+synthetic_prompt_time = ground_truth_time - reaction_delay
 ```
+
+其中 `reaction_delay` 是正数，表示 UI prompt 出现后，用户过一段时间才产生 EMG response。
 
 再将 `shifted_time` 输入 time alignment：
 
@@ -43,8 +45,11 @@ python -m generic_neuromotor_interface.scripts.discrete_gesture_alignment simula
   data/discrete_gestures_user_000_dataset_000.hdf5 \
   generic_neuromotor_interface/reports/time_alignment_reproduction/sim_shift_smoke \
   --num-prompts 24 \
-  --shift-range -0.25 0.25 \
-  --uncertainty -0.35 0.35 \
+  --shift-model prompt-delay \
+  --delay-mean 0.25 \
+  --delay-std 0.07 \
+  --delay-range 0.05 0.55 \
+  --uncertainty -0.10 0.70 \
   --feature envelope \
   --template-estimator average \
   --iterations 3 \
@@ -64,8 +69,11 @@ python -m generic_neuromotor_interface.scripts.discrete_gesture_alignment simula
   data/discrete_gestures_user_000_dataset_000.hdf5 \
   outputs/sim_shift_user_000_mpf_rerp \
   --num-prompts 500 \
-  --shift-range -0.25 0.25 \
-  --uncertainty -0.35 0.35 \
+  --shift-model prompt-delay \
+  --delay-mean 0.25 \
+  --delay-std 0.07 \
+  --delay-range 0.05 0.55 \
+  --uncertainty -0.10 0.70 \
   --feature mpf \
   --template-estimator rerp \
   --template-ridge 0.001 \
@@ -97,7 +105,8 @@ python -m generic_neuromotor_interface.scripts.discrete_gesture_alignment simula
 
 ```text
 *_simulated_shifted_prompts.csv
-  人为偏移后的 label time。
+  模拟出来的 prompt label time。默认 prompt-delay 模式下，
+  prompt time 会早于 ground truth event time。
 
 *_simulated_aligned_prompts.csv
   alignment 后的 recovered aligned_time，并包含 before/after error。
@@ -113,8 +122,7 @@ SVG 图中：
 
 ```text
 绿色 = ground truth event time，也就是公开 prompts.time
-蓝色虚线 = 随机偏移后的 input label time
+蓝色虚线 = 模拟出来的 input prompt label time
 红色 = alignment 恢复出的 aligned_time
 彩色曲线 = 16 个 raw sEMG channel 分开堆叠显示
 ```
-
