@@ -34,6 +34,10 @@ dependencies:
   - pip:
       - matplotlib==3.9.2
       - pytorch-lightning==1.8.6
+      # Optional: required for vision_gesture_qc video landmark extraction.
+      # Signal/detection logic and tests do not need these.
+      - mediapipe==0.10.14
+      - opencv-python==4.10.0.84
 # variables:
 #   # for deterministic algorithms
 #   # see: https://docs.pytorch.org/docs/stable/notes/randomness.html#avoiding-nondeterministic-algorithms

@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Gesture Prompt Collector</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main class="app">
+      <section class="stage" aria-label="Gesture prompt timeline">
+        <div class="hit-line" aria-hidden="true">
+          <span>HIT</span>
+        </div>
+        <div class="lanes" id="lanes"></div>
+        <div class="status-panel">
+          <div class="phase" id="phaseLabel">READY</div>
+          <div class="timer" id="timerLabel">10.0</div>
+          <div class="current" id="currentGesture">Load prompts</div>
+        </div>
+      </section>
+
+      <aside class="side">
+        <div class="brand">
+          <div class="title">Gesture Prompt Collector</div>
+          <div class="subtitle">20 prompts · 3 s interval · 10 s countdown</div>
+        </div>
+
+        <div class="meta">
+          <label>
+            Subject
+            <input id="subjectInput" value="S001" autocomplete="off">
+          </label>
+          <label>
+            Block
+            <input id="blockInput" value="B001" autocomplete="off">
+          </label>
+          <label>
+            Lead time
+            <input id="leadInput" type="number" min="1" step="0.5" value="3">
+          </label>
+          <label>
+            Countdown
+            <input id="countdownInput" type="number" min="0" step="1" value="10">
+          </label>
+        </div>
+
+        <div class="controls">
+          <button id="startButton" type="button">Start</button>
+          <button id="pauseButton" type="button">Pause</button>
+          <button id="resetButton" type="button">Reset</button>
+          <button id="syncButton" type="button">Sync marker</button>
+          <button id="downloadEventsButton" type="button">Download events</button>
+          <button id="downloadPromptsButton" type="button">Download prompts</button>
+        </div>
+
+        <label class="file-picker">
+          Load prompts.csv
+          <input id="promptFile" type="file" accept=".csv,text/csv">
+        </label>
+
+        <div class="readout">
+          <div><span>Trials</span><strong id="trialCount">0</strong></div>
+          <div><span>Elapsed</span><strong id="elapsedReadout">0.000</strong></div>
+          <div><span>Next</span><strong id="nextReadout">-</strong></div>
+        </div>
+      </aside>
+    </main>
+
+    <script type="module" src="./app.mjs"></script>
+  </body>
+</html>
